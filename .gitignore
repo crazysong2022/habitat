@@ -1,0 +1,115 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+mypy_cache/
+.dmypy.json
+.pyre/
+
+# =========================
+# Virtual Environments
+# =========================
+venv/
+env/
+myenv/
+ENV/
+env.bak/
+venv.bak/
+.env
+.venv
+
+# =========================
+# Streamlit
+# =========================
+# Streamlit 缓存（本地开发用，无需提交）
+.streamlit/
+~/.streamlit/
+
+# 上传的临时文件或用户生成数据（可选忽略）
+data/*.csv
+data/*.xlsx
+output/
+exports/
+
+# =========================
+# Jupyter Notebook
+# =========================
+*.ipynb
+.ipynb_checkpoints
+*.ipynb*
+nbformat/
+
+# =========================
+# IDE & Editors
+# =========================
+# VS Code
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# PyCharm
+.idea/
+*.iml
+
+# Emacs
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+
+# Vim
+.*.swp
+.*.swo
+*.tmp
+
+# =========================
+# OS Generated
+# =========================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# =========================
+# Logs and Databases
+# =========================
+*.log
+logs/
+*.sqlite3
+*.db
+
+# =========================
+# Environment Variables
+# =========================
+.env
+.env.local
+.env.development
+.env.production
+.env.test
+
+# =========================
+# Build & Distribution
+# =========================
+dist/
+build/
+*.egg-info/
+*.egg
+*.whl
+
+# =========================
+# Dependency Directories
+# =========================
+__pypackages__/
+pip-selfcheck.json
+gen_password.py
