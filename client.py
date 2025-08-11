@@ -1,17 +1,16 @@
-# client.py - 客户项目门户（双语支持）
+# client.py - 客户项目门户（云端安全执行）
 import streamlit as st
 import os
-import subprocess
+import importlib.util
 import sys
-import time
-import psycopg2
 from urllib.parse import urlparse
-from dotenv import load_dotenv
+import psycopg2
 import bcrypt
-import socket
+
 # -----------------------------
 # 加载环境变量
 # -----------------------------
+from dotenv import load_dotenv
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -43,11 +42,7 @@ def get_db_connection():
         st.error(f"🔗 Database connection failed: {e}")
         return None
 
-def hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
 # -----------------------------
 # 验证用户登录
 # -----------------------------
@@ -70,64 +65,42 @@ def verify_user(username: str, password: str):
     finally:
         conn.close()
 
-def project_exists(project_name: str) -> bool:
-    project_dir = f"projects/{project_name}"
-    app_path = f"{project_dir}/app.py"
-    return os.path.exists(app_path)
 
 # -----------------------------
 # 检查项目是否存在
 # -----------------------------
-def find_free_port():
-    """找一个空闲端口"""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        s.listen(1)
-        port = s.getsockname()[1]
-        return port
+def project_exists(project_name: str) -> bool:
+    return os.path.exists(f"projects/{project_name}/main.py")
 
+
+# -----------------------------
+# 动态运行项目模块
+# -----------------------------
 def run_project_app(project_name: str):
-    project_path = f"projects/{project_name}"
-    app_path = f"{project_path}/app.py"
+    project_path = f"projects/{project_name}/main.py"
 
-    if not os.path.exists(app_path):
-        st.error(f"❌ Project app.py not found: {app_path}")
+    if not os.path.exists(project_path):
+        st.error(f"❌ 项目文件未找到: {project_path}")
         return
 
-    # ✅ 自动找空闲端口
-    port = find_free_port()
-
     try:
-        proc = subprocess.Popen(
-            [
-                "streamlit", "run", "app.py",
-                f"--server.port={port}",
-                "--server.headless=true",
-                "--browser.gatherUsageStats=false"
-            ],
-            cwd=project_path,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding='utf-8'
-        )
+        # 动态导入模块
+        spec = importlib.util.spec_from_file_location(f"project_{project_name}", project_path)
+        module = importlib.util.module_from_spec(spec)
 
-        # 等待几秒看是否启动成功
-        time.sleep(3)
-        if proc.poll() is not None:
-            stderr = proc.stderr.read()
-            st.error("❌ Failed to start Streamlit app:")
-            st.code(stderr)
-            return
+        # 注入 streamlit 到 sys.modules，避免导入问题
+        sys.modules[f"project_{project_name}"] = module
 
-        # ✅ 启动成功
-        st.success("✅ Project is running!")
-        url = f"http://localhost:{port}"
-        st.markdown(f"🔗 **Access your project:**")
-        st.markdown(f"<a href='{url}' target='_blank' style='font-size: 1.1em;'>👉 Open Project {project_name} (Port {port})</a>", unsafe_allow_html=True)
+        # 执行模块
+        spec.loader.exec_module(module)
+
+        # 如果模块有 run() 函数，优先调用
+        if hasattr(module, "run"):
+            module.run()
 
     except Exception as e:
-        st.error(f"❌ Error: {e}")
+        st.error(f"❌ 运行项目失败：{e}")
+        st.code(f"Traceback:\n{e}", language="traceback")
 
 
 # -----------------------------
@@ -138,7 +111,6 @@ def render(t):
     st.markdown(t("client_intro"))
     st.markdown("---")
 
-    # 会话状态：是否已登录
     if "client_authenticated" not in st.session_state:
         _show_login_form(t)
     else:
@@ -146,9 +118,7 @@ def render(t):
 
 
 def _show_login_form(t):
-    """显示登录表单"""
     st.subheader(t("client_login"))
-
     username = st.text_input(t("client_username"), key="login_user")
     password = st.text_input(t("client_password"), type="password", key="login_pwd")
 
@@ -159,29 +129,24 @@ def _show_login_form(t):
             st.error(t("client_error_password"))
         else:
             project_name = verify_user(username.strip(), password)
-            if project_name:
-                if project_exists(project_name):
-                    st.session_state.client_authenticated = True
-                    st.session_state.project_name = project_name
-                    st.session_state.username = username.strip()
-                    st.rerun()
-                else:
-                    st.error(t("client_error_no_project").format(project=project_name))
+            if project_name and project_exists(project_name):
+                st.session_state.client_authenticated = True
+                st.session_state.project_name = project_name
+                st.session_state.username = username.strip()
+                st.rerun()
             else:
-                st.error(t("client_error_invalid"))
+                st.error(t("client_error_invalid") if not project_name else t("client_error_no_project").format(project=project_name))
 
 
 def _show_dashboard(t):
-    """已登录：显示项目信息和运行按钮"""
     st.success(f"✅ {t('client_welcome')} {st.session_state.username}!")
     st.info(f"{t('client_your_project')}: **{st.session_state.project_name}**")
 
     if st.button(t("client_run_app")):
-        with st.spinner(t("client_running")):
-            run_project_app(st.session_state.project_name)
+        st.markdown("---")
+        run_project_app(st.session_state.project_name)
 
     if st.button(t("client_logout")):
-        del st.session_state.client_authenticated
-        del st.session_state.project_name
-        del st.session_state.username
+        for key in ["client_authenticated", "project_name", "username"]:
+            st.session_state.pop(key, None)
         st.rerun()
