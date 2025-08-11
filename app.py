@@ -1,3 +1,4 @@
+# app.py - 主门户应用
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -116,23 +117,22 @@ with st.sidebar:
     st.image("images/logo.png", width=100)
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # --- 🔁 语言切换器（关键：放在 sidebar 最显眼位置）---
+    # --- 🔁 语言切换器 ---
     lang_choice = st.radio(
-        "Select Language",  # 这个 label 也会被翻译，但暂时英文
+        "Select Language",
         options=["English", "中文"],
         horizontal=True,
-        label_visibility="visible"
+        label_visibility="visible",
+        key="sidebar_language_radio"  # ✅ 修复：添加 key 防止状态丢失
     )
 
-    # 🔄 立即同步语言状态
     new_language = "zh" if lang_choice == "中文" else "en"
     
-    # 只有当语言变化时才触发重绘
     if new_language != st.session_state.language:
         st.session_state.language = new_language
-        st.rerun()  # ✅ 强制刷新整个页面！
+        st.rerun()
 
-    # --- 显示标题（现在确保每次重绘都用最新语言）---
+    # --- 显示标题 ---
     st.markdown(
         f"<h2 style='color: white; text-align: center; margin: 0;'>{t('app_title')}</h2>",
         unsafe_allow_html=True
@@ -150,7 +150,8 @@ with st.sidebar:
         "Go to",
         ["About", "Demo", "Chatbot", "Message", "Contact", "Admin", "Client"],
         format_func=lambda x: t(x.lower()),
-        label_visibility="collapsed"
+        label_visibility="collapsed",
+        key="sidebar_navigation_radio"  # ✅ 修复：添加 key
     )
 
 # -----------------------------
@@ -170,7 +171,6 @@ if page == "About":
     st.markdown("---")
     st.markdown(t("about_scenarios"))
 
-    # 行业应用场景（使用统一 key，自动切换语言）
     scenarios = [
         "finance", "healthcare", "education",
         "retail", "logistics", "research", "marketing"
@@ -199,7 +199,7 @@ elif page == "Contact":
 
 elif page == "Admin":
     import fetch_messages
-    fetch_messages.render(t)  # 保持原调用方式，不加认证
+    fetch_messages.render(t)
 
 elif page == "Client":
     import client

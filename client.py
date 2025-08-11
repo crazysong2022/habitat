@@ -6,11 +6,11 @@ import sys
 from urllib.parse import urlparse
 import psycopg2
 import bcrypt
+from dotenv import load_dotenv
 
 # -----------------------------
 # 加载环境变量
 # -----------------------------
-from dotenv import load_dotenv
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -84,19 +84,15 @@ def run_project_app(project_name: str):
         return
 
     try:
-        # 动态导入模块
         spec = importlib.util.spec_from_file_location(f"project_{project_name}", project_path)
         module = importlib.util.module_from_spec(spec)
-
-        # 注入 streamlit 到 sys.modules，避免导入问题
         sys.modules[f"project_{project_name}"] = module
-
-        # 执行模块
         spec.loader.exec_module(module)
 
-        # 如果模块有 run() 函数，优先调用
         if hasattr(module, "run"):
             module.run()
+        else:
+            st.error("❌ 项目模块缺少 `run()` 函数。")
 
     except Exception as e:
         st.error(f"❌ 运行项目失败：{e}")
@@ -119,10 +115,10 @@ def render(t):
 
 def _show_login_form(t):
     st.subheader(t("client_login"))
-    username = st.text_input(t("client_username"), key="login_user")
-    password = st.text_input(t("client_password"), type="password", key="login_pwd")
+    username = st.text_input(t("client_username"), key="client_login_username")
+    password = st.text_input(t("client_password"), type="password", key="client_login_password")
 
-    if st.button(t("client_login_button")):
+    if st.button(t("client_login_button"), key="client_login_btn"):
         if not username.strip():
             st.error(t("client_error_username"))
         elif not password:
@@ -142,11 +138,18 @@ def _show_dashboard(t):
     st.success(f"✅ {t('client_welcome')} {st.session_state.username}!")
     st.info(f"{t('client_your_project')}: **{st.session_state.project_name}**")
 
-    if st.button(t("client_run_app")):
-        st.markdown("---")
-        run_project_app(st.session_state.project_name)
+    st.markdown("---")
+    st.markdown(f"### 🚀 正在运行项目：{st.session_state.project_name}")
 
-    if st.button(t("client_logout")):
+    # ✅ 自动运行项目，无需按钮
+    run_project_app(st.session_state.project_name)
+
+    # ✅ 退出按钮放在最后
+    if st.button(t("client_logout"), key="client_logout_btn"):
+        # 清理项目模块缓存（可选）
+        if "loaded_project_module" in st.session_state:
+            st.session_state.pop("loaded_project_module", None)
+        # 清理用户状态
         for key in ["client_authenticated", "project_name", "username"]:
             st.session_state.pop(key, None)
         st.rerun()
