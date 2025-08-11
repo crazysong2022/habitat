@@ -163,16 +163,14 @@ def run():
                     fig.update_layout(height=600)
                     st.plotly_chart(fig, use_container_width=True)
 
-                    # 下载图表为 PNG
-                    buf = BytesIO()
-                    fig.write_image(buf, format='png', scale=2)
-                    buf.seek(0)
+                    # ✅ 新代码：导出为 SVG（纯文本，无需浏览器）
+                    svg_data = fig.to_image(format="svg")
                     st.download_button(
-                        label="📥 下载图表为 PNG",
-                        data=buf,
-                        file_name=f"{chart_type}_图表.png",
-                        mime="image/png",
-                        key=f"{NS}_download_png"
+                      label="📥 下载图表为 SVG",
+                      data=svg_data,
+                      file_name=f"{chart_type}_图表.svg",
+                      mime="image/svg+xml",
+                      key=f"{NS}_download_svg"
                     )
 
             except Exception as e:
