@@ -198,8 +198,8 @@ elif page == "Contact":
     contact.render(t)
 
 elif page == "Admin":
-    import fetch_messages
-    fetch_messages.render(t)
+    import data_hub
+    data_hub.render(t)
 
 elif page == "Client":
     import client
