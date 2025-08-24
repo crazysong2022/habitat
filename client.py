@@ -139,17 +139,17 @@ def _show_dashboard(t):
     st.info(f"{t('client_your_project')}: **{st.session_state.project_name}**")
 
     st.markdown("---")
-    st.markdown(f"### 🚀 正在运行项目：{st.session_state.project_name}")
+    st.markdown(f"### 🚀 {t('client_running_project')}: {st.session_state.project_name}")
 
-    # ✅ 自动运行项目，无需按钮
+    # 运行项目主模块
     run_project_app(st.session_state.project_name)
 
-    # ✅ 退出按钮放在最后
-    if st.button(t("client_logout"), key="client_logout_btn"):
-        # 清理项目模块缓存（可选）
-        if "loaded_project_module" in st.session_state:
-            st.session_state.pop("loaded_project_module", None)
-        # 清理用户状态
-        for key in ["client_authenticated", "project_name", "username"]:
+    # 🧩 将登出按钮放入侧边栏
+    st.sidebar.markdown("---")
+    st.sidebar.subheader(f"👤 {t('client_logged_in_as')} {st.session_state.username}")
+    if st.sidebar.button(t("client_logout"), key="client_logout_sidebar_btn", type="secondary", use_container_width=True):
+        # 清理会话状态
+        keys_to_remove = ["client_authenticated", "project_name", "username", "loaded_project_module"]
+        for key in keys_to_remove:
             st.session_state.pop(key, None)
         st.rerun()

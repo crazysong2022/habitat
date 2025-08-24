@@ -320,6 +320,8 @@ These dashboards can connect to:
 "client_run_app": "▶️ Run Project App",
 "client_running": "Running project...",
 "client_logout": "Logout",
+"client_running_project": "Running project",
+"client_logged_in_as": "Logged in as",
     },
     "zh": {
         # ====== App Level ======
@@ -636,5 +638,7 @@ These dashboards can connect to:
 "client_run_app": "▶️ 运行项目应用",
 "client_running": "正在运行项目...",
 "client_logout": "退出登录",
+"client_running_project": "正在运行项目" ,
+"client_logged_in_as": "已登录为",
     }
 }
