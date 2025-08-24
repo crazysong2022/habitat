@@ -14,27 +14,38 @@ from dotenv import load_dotenv
 # 1. 加载环境变量
 # ================================
 def load_environment():
+    # -----------------------------
+    # 直接依赖 os.environ（由 .env 或 Secrets 注入）
+    # -----------------------------
+    api_key = os.getenv("DASHSCOPE_API_KEY")
+    base_url = os.getenv("DASHSCOPE_BASE_URL")
+
+    # 如果环境变量已经存在（线上 Secrets 注入），直接返回
+    if api_key and base_url:
+        return {"api_key": api_key, "base_url": base_url.strip()}
+
+    # 否则尝试加载本地 .env
     env_path = Path(__file__).parent.parent.parent / ".env"
     if env_path.exists():
         load_dotenv(dotenv_path=env_path)
+        st.info(f"📁 从本地 .env 加载配置：{env_path}")
     else:
-        st.error(f"❌ 未找到 .env 文件，请确保它在：{env_path}")
+        st.error(f"❌ 未找到 .env 文件：{env_path}")
+        st.info("💡 提示：\n- 本地请确保 `.env` 存在\n- 线上请在 Secrets 中设置 `DASHSCOPE_API_KEY` 和 `DASHSCOPE_BASE_URL`")
         return None
 
+    # 再次尝试从环境变量读取
     api_key = os.getenv("DASHSCOPE_API_KEY")
     base_url = os.getenv("DASHSCOPE_BASE_URL")
 
     if not api_key:
-        st.error("❌ 环境变量 `DASHSCOPE_API_KEY` 未设置")
+        st.error("❌ 请设置 `DASHSCOPE_API_KEY`")
         return None
     if not base_url:
-        st.error("❌ 环境变量 `DASHSCOPE_BASE_URL` 未设置")
+        st.error("❌ 请设置 `DASHSCOPE_BASE_URL`")
         return None
 
-    return {
-        "api_key": api_key,
-        "base_url": base_url.strip()
-    }
+    return {"api_key": api_key, "base_url": base_url.strip()}
 
 
 # ================================
