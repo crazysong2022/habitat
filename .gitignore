@@ -113,3 +113,4 @@ build/
 __pypackages__/
 pip-selfcheck.json
 gen_password.py
+git_upload_test.py
