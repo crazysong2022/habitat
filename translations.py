@@ -322,6 +322,77 @@ These dashboards can connect to:
 "client_logout": "Logout",
 "client_running_project": "Running project",
 "client_logged_in_as": "Logged in as",
+
+"demo_agriculture": "Agriculture",
+    "demo_agriculture_cropping": "Crop Farming",
+    "demo_agriculture_livestock": "Livestock Farming",
+    "demo_agriculture_processing": "Agri-Processing",
+    "demo_agriculture_acquire_title": "Data Acquisition for Agriculture",
+    "demo_agriculture_acquire_desc": "Generate synthetic data for crop, livestock, and agri-processing scenarios.",
+    
+    # Crop Farming
+    "demo_agriculture_cropping_title": "Crop Farming Data",
+    "demo_agriculture_cropping_desc": "Simulate yield, soil moisture, weather, and pesticide use across regions.",
+    "demo_agriculture_cropping_regions": "Select Regions",
+    "demo_agriculture_cropping_crops": "Select Crops",
+    "demo_agriculture_cropping_days": "Simulation Duration (Days)",
+    "demo_agriculture_cropping_generate": "Generate Crop Data",
+    "demo_agriculture_cropping_generated": "Crop farming data generated successfully!",
+    "demo_agriculture_cropping_yield": "Yield (kg/ha)",
+    "demo_agriculture_cropping_moisture": "Soil Moisture (%)",
+    "demo_agriculture_cropping_rainfall": "Rainfall (mm)",
+    "demo_agriculture_cropping_pesticide": "Pesticide Use (L/ha)",
+    "demo_agriculture_cropping_yield_trend": "Crop Yield Trend Over Time",
+    "demo_agriculture_cropping_correlation": "Correlation Between Yield and Environmental Factors",
+    "demo_agriculture_cropping_high_yield": "High-yield regions detected: ",
+    "demo_agriculture_cropping_low_yield": "Low-yield regions detected: ",
+    
+    # Livestock
+    "demo_agriculture_livestock_title": "Livestock Farming Data",
+    "demo_agriculture_livestock_desc": "Simulate animal health metrics, feed consumption, milk/egg production, and disease alerts.",
+    "demo_agriculture_livestock_animals": "Select Animal Types",
+    "demo_agriculture_livestock_farms": "Number of Farms",
+    "demo_agriculture_livestock_days": "Simulation Duration (Days)",
+    "demo_agriculture_livestock_generate": "Generate Livestock Data",
+    "demo_agriculture_livestock_generated": "Livestock farming data generated successfully!",
+    "demo_agriculture_livestock_weight": "Average Weight (kg)",
+    "demo_agriculture_livestock_milk": "Milk Production (L/day)",
+    "demo_agriculture_livestock_eggs": "Eggs Laid (count/day)",
+    "demo_agriculture_livestock_feed": "Feed Consumption (kg/day)",
+    "demo_agriculture_livestock_temp": "Body Temperature (°C)",
+    "demo_agriculture_livestock_alert": "Health Alert",
+    "demo_agriculture_livestock_health_trend": "Animal Health Trends",
+    "demo_agriculture_livestock_prod_vs_feed": "Production vs Feed Efficiency",
+    "demo_agriculture_livestock_disease_rate": "Disease Incidence Rate",
+    
+    # Agri-Processing
+    "demo_agriculture_processing_title": "Agri-Processing Data",
+    "demo_agriculture_processing_desc": "Simulate processing plant operations: input volume, output quality, energy use, waste, and yield loss.",
+    "demo_agriculture_processing_plants": "Number of Processing Plants",
+    "demo_agriculture_processing_input": "Raw Input Volume (tons)",
+    "demo_agriculture_processing_output": "Processed Output (tons)",
+    "demo_agriculture_processing_energy": "Energy Consumption (kWh)",
+    "demo_agriculture_processing_waste": "Waste Generated (tons)",
+    "demo_agriculture_processing_yield_loss": "Yield Loss (%)",
+    "demo_agriculture_processing_quality": "Product Quality Score",
+    "demo_agriculture_processing_generate": "Generate Processing Data",
+    "demo_agriculture_processing_generated": "Agri-processing data generated successfully!",
+    "demo_agriculture_processing_efficiency": "Processing Efficiency (%)",
+    "demo_agriculture_processing_yield_loss_trend": "Yield Loss Over Time",
+    "demo_agriculture_processing_energy_vs_output": "Energy Consumption vs Output",
+    "demo_agriculture_processing_quality_dist": "Product Quality Distribution",
+
+    # Data Hub (可选：自动包含农业)
+    "demo_datahub_select": "Select Dataset to Export",
+    "demo_datahub_download": "Download {domain} dataset as CSV",
+    "demo_datahub_integration": "Integration with IoT sensors, ERP systems, and government agricultural databases is supported.",
+    "demo_datahub_connect": "Use our API or upload .csv/.xlsx files directly.",
+    # 👇 新增缺失的这一个（关键！）
+    "demo_agriculture_processing_days": "Simulation Duration (Days)",
+
+    # 其他农业键（如果你还没加，一并补上）
+    "demo_agriculture_cropping_days": "Simulation Duration (Days)",
+    "demo_agriculture_livestock_days": "Simulation Duration (Days)",
     },
     "zh": {
         # ====== App Level ======
@@ -640,5 +711,75 @@ These dashboards can connect to:
 "client_logout": "退出登录",
 "client_running_project": "正在运行项目" ,
 "client_logged_in_as": "已登录为",
+"demo_agriculture": "农业",
+    "demo_agriculture_cropping": "种植业",
+    "demo_agriculture_livestock": "畜牧业",
+    "demo_agriculture_processing": "农业加工",
+    "demo_agriculture_acquire_title": "农业数据采集",
+    "demo_agriculture_acquire_desc": "生成种植、畜牧和农产品加工的模拟数据。",
+    
+    # 种植业
+    "demo_agriculture_cropping_title": "种植业数据",
+    "demo_agriculture_cropping_desc": "模拟不同区域的作物产量、土壤湿度、天气和农药使用情况。",
+    "demo_agriculture_cropping_regions": "选择区域",
+    "demo_agriculture_cropping_crops": "选择作物",
+    "demo_agriculture_cropping_days": "模拟时长（天）",
+    "demo_agriculture_cropping_generate": "生成种植数据",
+    "demo_agriculture_cropping_generated": "种植数据已成功生成！",
+    "demo_agriculture_cropping_yield": "产量（公斤/公顷）",
+    "demo_agriculture_cropping_moisture": "土壤湿度（%）",
+    "demo_agriculture_cropping_rainfall": "降雨量（毫米）",
+    "demo_agriculture_cropping_pesticide": "农药用量（升/公顷）",
+    "demo_agriculture_cropping_yield_trend": "作物产量趋势",
+    "demo_agriculture_cropping_correlation": "产量与环境因素的相关性",
+    "demo_agriculture_cropping_high_yield": "高产区域：",
+    "demo_agriculture_cropping_low_yield": "低产区域：",
+    
+    # 畜牧业
+    "demo_agriculture_livestock_title": "畜牧业数据",
+    "demo_agriculture_livestock_desc": "模拟动物健康指标、饲料消耗、奶/蛋产量和疾病预警。",
+    "demo_agriculture_livestock_animals": "选择动物类型",
+    "demo_agriculture_livestock_farms": "农场数量",
+    "demo_agriculture_livestock_days": "模拟时长（天）",
+    "demo_agriculture_livestock_generate": "生成畜牧数据",
+    "demo_agriculture_livestock_generated": "畜牧数据已成功生成！",
+    "demo_agriculture_livestock_weight": "平均体重（公斤）",
+    "demo_agriculture_livestock_milk": "产奶量（升/天）",
+    "demo_agriculture_livestock_eggs": "产蛋量（枚/天）",
+    "demo_agriculture_livestock_feed": "饲料消耗（公斤/天）",
+    "demo_agriculture_livestock_temp": "体温（℃）",
+    "demo_agriculture_livestock_alert": "健康预警",
+    "demo_agriculture_livestock_health_trend": "动物健康趋势",
+    "demo_agriculture_livestock_prod_vs_feed": "产量 vs 饲料效率",
+    "demo_agriculture_livestock_disease_rate": "疾病发生率",
+    
+    # 农业加工
+    "demo_agriculture_processing_title": "农业加工数据",
+    "demo_agriculture_processing_desc": "模拟加工厂运营：输入量、产出质量、能耗、废弃物和损耗率。",
+    "demo_agriculture_processing_plants": "加工厂数量",
+    "demo_agriculture_processing_input": "原料输入量（吨）",
+    "demo_agriculture_processing_output": "成品输出量（吨）",
+    "demo_agriculture_processing_energy": "能源消耗（千瓦时）",
+    "demo_agriculture_processing_waste": "废弃物产生量（吨）",
+    "demo_agriculture_processing_yield_loss": "损耗率（%）",
+    "demo_agriculture_processing_quality": "产品质量评分",
+    "demo_agriculture_processing_generate": "生成加工数据",
+    "demo_agriculture_processing_generated": "农业加工数据已成功生成！",
+    "demo_agriculture_processing_efficiency": "加工效率（%）",
+    "demo_agriculture_processing_yield_loss_trend": "损耗率随时间变化",
+    "demo_agriculture_processing_energy_vs_output": "能耗 vs 输出量",
+    "demo_agriculture_processing_quality_dist": "产品质量分布",
+    # 👇 新增缺失的这一个（关键！）
+    "demo_agriculture_processing_days": "模拟时长（天）",
+
+    # 其他农业键（如果你还没加，一并补上）
+    "demo_agriculture_cropping_days": "模拟时长（天）",
+    "demo_agriculture_livestock_days": "模拟时长（天）",
+
+    # Data Hub（保持不变）
+    "demo_datahub_select": "选择要导出的数据集",
+    "demo_datahub_download": "下载 {domain} 数据集为 CSV",
+    "demo_datahub_integration": "支持与物联网传感器、ERP系统和政府农业数据库集成。",
+    "demo_datahub_connect": "可通过API或直接上传.csv/.xlsx文件。"
     }
 }

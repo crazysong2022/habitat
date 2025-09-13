@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from urllib.parse import urlparse
 import psycopg2
 from dotenv import load_dotenv
+import importlib
 
 load_dotenv()
 
@@ -31,6 +32,15 @@ def get_ehr_db_connection():
     except Exception as e:
         st.error(f"❌ 数据库连接失败: {e}")
         return None
+    
+CATEGORY_TO_TABS_MODULE = {
+    "监测": "monitoring",
+    "饮食": "diet",
+    "运动": "exercise",
+    "心理": "mental",
+    "药物": "medication",
+}
+
 from openai import OpenAI
 
 @st.cache_resource
@@ -381,10 +391,11 @@ def render_expanders_for_category(item_type: str):
 
     st.subheader(f"📌 {item_type} 相关模块")
 
+    # ========== 渲染所有 expanders ==========
     for i, (title, icon) in enumerate(expanders_config):
         load_key = f"load_data_{item_type}_{i}_{title.replace(' ', '_')}"
         show_form_key = f"show_form_{item_type}_{i}"
-        show_ai_key = f"show_ai_{item_type}_{i}"  # 新增：控制AI助手显示
+        show_ai_key = f"show_ai_{item_type}_{i}"
 
         with st.expander(f"{icon} {title}"):
             col1, col2, col3 = st.columns(3)
@@ -415,6 +426,36 @@ def render_expanders_for_category(item_type: str):
             # ========== 图表 ==========
             if st.session_state.get(load_key, False):
                 render_dashboard_for_items(st.session_state["ehr_id"], title)
+
+    # ========== 动态加载专属 Tabs（放在 for 循环外！） ========== 👇
+    st.markdown("---")
+    st.subheader("📌 专属分析面板")
+
+    module_name = CATEGORY_TO_TABS_MODULE.get(item_type)
+    if not module_name:
+        st.info("ℹ️ 该类别暂无专属分析面板")
+        return
+
+    # 构造绝对路径
+    tabs_dir = os.path.join(os.path.dirname(__file__), "tabs")
+    module_file = os.path.join(tabs_dir, f"{module_name}.py")
+
+    if not os.path.exists(module_file):
+        st.info(f"ℹ️ 专属面板模块 `{module_name}.py` 尚未创建")
+        return
+
+    try:
+        spec = importlib.util.spec_from_file_location(module_name, module_file)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        if hasattr(module, "render_tabs"):
+            module.render_tabs(st.session_state["ehr_id"])
+        else:
+            st.warning(f"⚠️ 模块 `{module_name}` 未定义 `render_tabs` 函数")
+
+    except Exception as e:
+        st.error(f"❌ 加载模块 `{module_name}.py` 失败: {e}")
 
 @st.cache_data(ttl=3600)  # 缓存1小时，结构不会频繁变
 def get_sample_fields_for_items(ehr_id: int, item_type: str) -> list:
