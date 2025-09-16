@@ -1,285 +1,543 @@
 # projects/blockchain_ledger/main.py
-"""
-项目：区块链防篡改记账系统（修复哈希校验逻辑）
-功能：收入/支出记录，通过哈希链保证不可篡改，支持完整性验证
-"""
-
 import streamlit as st
-import pandas as pd
-import hashlib
-import json
+import psycopg2
+from psycopg2.extras import RealDictCursor, Json  # 👈 修复关键：导入 Json
+from urllib.parse import urlparse
 import os
-from datetime import datetime
-from typing import Dict, List
+from datetime import datetime, timedelta
+import pandas as pd  # 👈 新增
+import plotly.express as px  # 👈 新增
+from dotenv import load_dotenv
 
 # -----------------------------
-# 命名空间（防止组件 key 冲突）
+# 加载环境变量
 # -----------------------------
-NS = "ledger_blockchain"
+load_dotenv()
 
-# -----------------------------
-# 区块类定义（不信任任何外部 hash）
-# -----------------------------
-class Block:
-    def __init__(self, index: int, timestamp: str, data: Dict, previous_hash: str, stored_hash: str = None):
-        self.index = index
-        self.timestamp = timestamp
-        self.data = data
-        self.previous_hash = previous_hash
-        self.stored_hash = stored_hash  # 文件中保存的 hash（仅用于对比）
-
-    def compute_hash(self) -> str:
-        """根据当前内容计算 SHA-256 哈希"""
-        block_content = f"{self.index}{self.timestamp}{json.dumps(self.data, sort_keys=True)}{self.previous_hash}"
-        return hashlib.sha256(block_content.encode('utf-8')).hexdigest()
-
-    def to_dict(self) -> dict:
-        """导出为字典（用于保存）"""
-        return {
-            "index": self.index,
-            "timestamp": self.timestamp,
-            "data": self.data,
-            "previous_hash": self.previous_hash,
-            "hash": self.stored_hash or self.compute_hash()
-        }
-
+DATABASE_LEDGER_URL = os.getenv("DATABASE_LEDGER_URL")
+if not DATABASE_LEDGER_URL:
+    st.error("❌ DATABASE_LEDGER_URL 未设置，请检查 .env 文件。")
+    st.stop()
 
 # -----------------------------
-# 账本区块链类（强化校验逻辑）
+# 数据库连接函数
 # -----------------------------
-class BlockchainLedger:
-    def __init__(self, data_file: str = "data/blockchain_ledger.json"):
-        self.data_file = data_file
-        self.chain: List[Block] = []
-        self._ensure_data_dir()
-        self.load_chain()
-
-    def _ensure_data_dir(self):
-        os.makedirs(os.path.dirname(self.data_file), exist_ok=True)
-
-    def create_genesis_block(self) -> Block:
-        data = {
-            "type": "系统",
-            "amount": 0.0,
-            "account": "系统",
-            "desc": "创世区块，链的起点"
-        }
-        computed_hash = hashlib.sha256(
-            f"0{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{json.dumps(data, sort_keys=True)}0".encode('utf-8')
-        ).hexdigest()
-        return Block(
-            index=0,
-            timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            data=data,
-            previous_hash="0",
-            stored_hash=computed_hash
+def get_ledger_db_connection():
+    try:
+        url = urlparse(DATABASE_LEDGER_URL)
+        conn = psycopg2.connect(
+            host=url.hostname,
+            port=url.port or 5432,
+            database=url.path[1:],
+            user=url.username,
+            password=url.password,
         )
-
-    def load_chain(self):
-        if not os.path.exists(self.data_file):
-            self.chain = [self.create_genesis_block()]
-            self.save_chain()
-            st.info("📘 新账本已创建：创世区块已生成。")
-            return
-
-        try:
-            with open(self.data_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            self.chain = []
-
-            for item in data: 
-                block = Block(
-                    index=item["index"],
-                    timestamp=item["timestamp"],
-                    data=item["data"],
-                    previous_hash=item["previous_hash"],
-                    stored_hash=item["hash"]
-                )
-                computed = block.compute_hash()
-                if computed != item["hash"]:
-                    st.error(f"🚨 区块 {block.index} 的哈希不匹配！内容可能已被篡改！")
-                self.chain.append(block)
-
-            st.success(f"✅ 已加载 {len(self.chain) - 1} 条账目记录。")
-
-        except Exception as e:
-            st.error(f"❌ 加载账本失败：{e}")
-
-    def save_chain(self):
-        try:
-            with open(self.data_file, 'w', encoding='utf-8') as f:
-                json.dump([b.to_dict() for b in self.chain], f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            st.error(f"❌ 保存账本失败：{e}")
-
-    def add_entry(self, entry_data: Dict) -> bool:
-        last_block = self.chain[-1]
-        new_index = last_block.index + 1
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        # 创建新区块（stored_hash 由 compute_hash 生成）
-        new_block = Block(
-            index=new_index,
-            timestamp=timestamp,
-            data=entry_data,
-            previous_hash=last_block.compute_hash()  # 使用真实计算的哈希
-        )
-        # 注意：stored_hash 就是 compute_hash() 的结果
-        new_block.stored_hash = new_block.compute_hash()
-
-        self.chain.append(new_block)
-        self.save_chain()
-        return True
-
-    def is_intact(self) -> bool:
-        """完全重新验证账本完整性，不依赖任何缓存值"""
-        if not self.chain:
-            return True
-
-        # 1. 验证创世块
-        genesis = self.chain[0]
-        if genesis.index != 0 or genesis.previous_hash != "0":
-            st.error("❌ 创世区块结构异常：index 不为 0 或 previous_hash 不为 '0'")
-            return False
-
-        computed_genesis_hash = genesis.compute_hash()
-        if computed_genesis_hash != genesis.stored_hash:
-            st.error("❌ 创世区块存储的哈希与内容不匹配")
-            return False
-
-        # 2. 验证后续区块（链式校验）
-        prev_computed_hash = computed_genesis_hash  # 上一个区块实际计算出的哈希
-
-        for i in range(1, len(self.chain)):
-            block = self.chain[i]
-
-            # 检查前向链接
-            if block.previous_hash != prev_computed_hash:
-                st.error(f"❌ 区块 {i} 的 previous_hash 不等于前一个区块的实际哈希")
-                return False
-
-            # 检查当前区块哈希一致性
-            computed_hash = block.compute_hash()
-            if computed_hash != block.stored_hash:
-                st.error(f"❌ 区块 {i} 存储的哈希与内容不匹配")
-                return False
-
-            # 更新 prev_computed_hash
-            prev_computed_hash = computed_hash
-
-        return True
-
-    def to_dataframe(self) -> pd.DataFrame:
-        records = []
-        for block in self.chain:
-            if block.index == 0:
-                continue  # 跳过创世块
-            records.append({
-                "序号": block.index,
-                "时间": block.timestamp,
-                "类别": block.data["type"],
-                "账户": block.data["account"],
-                "金额": f"¥ {block.data['amount']:,.2f}",
-                "说明": block.data["desc"],
-                "哈希片段": block.stored_hash[:8] + "..." if block.stored_hash else "?"
-            })
-        return pd.DataFrame(records)
+        return conn
+    except Exception as e:
+        st.error(f"🔗 数据库连接失败: {e}")
+        return None
 
 
 # -----------------------------
-# 入口函数（被 client.py 调用）
+# 初始化数据库
 # -----------------------------
-def run():
-    st.subheader("🔐 区块链记账系统 | 防篡改 · 可追溯 · 可验证")
-    st.markdown("""
-    > 每一笔账目都通过 **密码学哈希链** 连接，任何修改都会破坏链条，立即暴露。
-    >
-    > 📌 本系统不提供删除或编辑功能 —— 因为真实世界中的审计，不该允许“擦掉历史”。
-    """)
-    st.warning("⚠️ 提示：账本存储于服务器端文件，防篡改基于哈希链。建议定期导出并离线备份。")
+def init_db():
+    conn = get_ledger_db_connection()
+    if not conn:
+        return
 
-    # 初始化账本
-    ledger = BlockchainLedger(data_file="data/blockchain_ledger.json")
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    username VARCHAR(50) UNIQUE NOT NULL,
+                    role VARCHAR(20) NOT NULL CHECK (role IN ('cashier', 'approver')),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
 
-    # -----------------------------
-    # 添加新账目
-    # -----------------------------
-    st.markdown("### 📝 添加新账目")
+            cur.execute("SELECT id FROM users WHERE username = 'cashier'")
+            if not cur.fetchone():
+                cur.execute("INSERT INTO users (username, role) VALUES ('cashier', 'cashier')")
+            cur.execute("SELECT id FROM users WHERE username = 'boss'")
+            if not cur.fetchone():
+                cur.execute("INSERT INTO users (username, role) VALUES ('boss', 'approver')")
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS transactions (
+                    id SERIAL PRIMARY KEY,
+                    description TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    amount DECIMAL(12, 2) NOT NULL,
+                    category VARCHAR(50),
+                    trans_type VARCHAR(10) NOT NULL CHECK (trans_type IN ('income', 'expense')),
+                    need_approval BOOLEAN DEFAULT FALSE,
+                    approved BOOLEAN DEFAULT FALSE,
+                    approved_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    cashier_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    approved_at TIMESTAMP
+                );
+            """)
+
+            try:
+                cur.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT '未指定来源'")
+            except:
+                pass
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id SERIAL PRIMARY KEY,
+                    action VARCHAR(50) NOT NULL,
+                    user_id INTEGER REFERENCES users(id),
+                    transaction_id INTEGER REFERENCES transactions(id) ON DELETE CASCADE,
+                    details JSONB,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+
+            conn.commit()
+            st.success("✅ 数据库初始化完成")
+    except Exception as e:
+        st.error(f"❌ 初始化数据库失败: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+# -----------------------------
+# 获取用户ID
+# -----------------------------
+def get_user_id_by_role(role: str) -> int:
+    conn = get_ledger_db_connection()
+    if not conn:
+        return -1
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM users WHERE username = %s", ("cashier" if role == "cashier" else "boss",))
+            row = cur.fetchone()
+            return row[0] if row else -1
+    except Exception as e:
+        st.error(f"❌ 获取用户ID失败: {e}")
+        return -1
+    finally:
+        if conn:
+            conn.close()
+
+
+# -----------------------------
+# 创建交易记录
+# -----------------------------
+def create_transaction(description, source, amount, category, trans_type, cashier_id):
+    conn = get_ledger_db_connection()
+    if not conn:
+        return None
+
+    need_approval = abs(amount) >= 100000
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO transactions (description, source, amount, category, trans_type, need_approval, cashier_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (description, source, amount, category, trans_type, need_approval, cashier_id))
+            trans_id = cur.fetchone()[0]
+
+            # ✅ 修复：用 Json 包装字典
+            cur.execute("""
+                INSERT INTO audit_log (action, user_id, transaction_id, details)
+                VALUES (%s, %s, %s, %s)
+            """, ('create', cashier_id, trans_id, Json({
+                'description': description,
+                'source': source,
+                'amount': float(amount),
+                'category': category,
+                'trans_type': trans_type,
+                'need_approval': need_approval
+            })))
+            conn.commit()
+            return trans_id
+    except Exception as e:
+        st.error(f"❌ 创建交易失败: {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
+# -----------------------------
+# 获取待审批交易
+# -----------------------------
+def get_pending_transactions():
+    conn = get_ledger_db_connection()
+    if not conn:
+        return []
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT t.*, u.username as cashier_name
+                FROM transactions t
+                JOIN users u ON t.cashier_id = u.id
+                WHERE t.need_approval = TRUE AND t.approved = FALSE
+                ORDER BY t.created_at DESC
+            """)
+            return cur.fetchall()
+    except Exception as e:
+        st.error(f"❌ 获取待审批交易失败: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+# -----------------------------
+# 审批交易
+# -----------------------------
+def approve_transaction(trans_id, approver_id):
+    conn = get_ledger_db_connection()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE transactions
+                SET approved = TRUE, approved_by = %s, approved_at = NOW()
+                WHERE id = %s AND need_approval = TRUE AND approved = FALSE
+                RETURNING id
+            """, (approver_id, trans_id))
+            if cur.fetchone():
+                # ✅ 修复：用 Json 包装字典
+                cur.execute("""
+                    INSERT INTO audit_log (action, user_id, transaction_id, details)
+                    VALUES (%s, %s, %s, %s)
+                """, ('approve', approver_id, trans_id, Json({
+                    'approved_at': str(datetime.now())
+                })))
+                conn.commit()
+                return True
+            else:
+                st.warning("⚠️ 该记录已被审批或不存在。")
+                return False
+    except Exception as e:
+        st.error(f"❌ 审批失败: {e}")
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+# -----------------------------
+# 获取所有交易（按角色）
+# -----------------------------
+def get_all_transactions(user_role, user_id):
+    conn = get_ledger_db_connection()
+    if not conn:
+        return []
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if user_role == "approver":
+                cur.execute("""
+                    SELECT t.*, u.username as cashier_name, a.username as approver_name
+                    FROM transactions t
+                    JOIN users u ON t.cashier_id = u.id
+                    LEFT JOIN users a ON t.approved_by = a.id
+                    ORDER BY t.created_at DESC
+                """)
+            else:
+                cur.execute("""
+                    SELECT t.*, u.username as cashier_name, a.username as approver_name
+                    FROM transactions t
+                    JOIN users u ON t.cashier_id = u.id
+                    LEFT JOIN users a ON t.approved_by = a.id
+                    WHERE t.cashier_id = %s
+                    ORDER BY t.created_at DESC
+                """, (user_id,))
+            return cur.fetchall()
+    except Exception as e:
+        st.error(f"❌ 获取交易记录失败: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+# -----------------------------
+# 🆕 获取时间段内交易数据（用于图表）
+# -----------------------------
+def get_filtered_transactions_for_charts(start_date, end_date):
+    conn = get_ledger_db_connection()
+    if not conn:
+        return []
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT 
+                    DATE(created_at) as date,
+                    category,
+                    trans_type,
+                    SUM(amount) as daily_total
+                FROM transactions
+                WHERE created_at >= %s AND created_at <= %s
+                GROUP BY DATE(created_at), category, trans_type
+                ORDER BY date
+            """, (start_date, end_date))
+            return cur.fetchall()
+    except Exception as e:
+        st.error(f"❌ 获取图表数据失败: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+# -----------------------------
+# 🆕 领导专属图表面板
+# -----------------------------
+def _show_approver_charts(approver_id):
+    st.header("📊 财务可视化分析")
+
+    # 时间范围选择
     col1, col2 = st.columns(2)
     with col1:
-        trans_type = st.selectbox("类型", ["收入", "支出", "转账", "其他"], key=f"{NS}_type")
-        account = st.text_input("账户/来源", placeholder="如：现金、招商银行、支付宝", key=f"{NS}_account")
+        start_date = st.date_input("开始日期", value=datetime.now() - timedelta(days=30))
     with col2:
-        amount = st.number_input("金额", min_value=0.01, step=0.01, format="%.2f", key=f"{NS}_amount")
-        desc = st.text_input("说明", placeholder="例如：客户A付款、办公用品采购", key=f"{NS}_desc")
+        end_date = st.date_input("结束日期", value=datetime.now())
 
-    if st.button("✅ 提交记账", key=f"{NS}_submit"):
-        if not account.strip():
-            st.error("请填写账户信息")
-        elif amount <= 0:
-            st.error("金额必须大于 0")
-        else:
-            data = {
-                "type": trans_type,
-                "amount": round(float(amount), 2),
-                "account": account.strip(),
-                "desc": desc.strip() or "无说明"
-            }
-            if ledger.add_entry(data):
-                st.success(f"✅ 第 {ledger.chain[-1].index} 笔账目已上链！")
-                st.balloons()
+    if start_date > end_date:
+        st.error("❌ 开始日期不能晚于结束日期")
+        return
 
-    st.markdown("---")
+    # 获取数据
+    rows = get_filtered_transactions_for_charts(start_date, end_date + timedelta(days=1))  # 包含结束日
+    if not rows:
+        st.info("📈 所选时间段内无数据")
+        return
 
-    # -----------------------------
-    # 查看账本
-    # -----------------------------
-    st.markdown("### 📚 账本记录")
-    df = ledger.to_dataframe()
+    # 转为 DataFrame
+    df = pd.DataFrame(rows)
 
-    if df.empty:
-        st.info("暂无账目记录，请添加第一笔。")
-    else:
-        st.dataframe(df, use_container_width=True)
+    # 按日汇总收入/支出
+    df_income = df[df['trans_type'] == 'income'].groupby('date')['daily_total'].sum().reset_index()
+    df_expense = df[df['trans_type'] == 'expense'].groupby('date')['daily_total'].sum().reset_index()
+    df_income.rename(columns={'daily_total': 'income'}, inplace=True)
+    df_expense.rename(columns={'daily_total': 'expense'}, inplace=True)
 
-        # 统计
-        raw_data = pd.DataFrame([
-            {**b.data, "amount": float(b.data["amount"])}
-            for b in ledger.chain[1:]
-        ])
-        total_in = raw_data[raw_data["type"] == "收入"]["amount"].sum()
-        total_out = raw_data[raw_data["type"] == "支出"]["amount"].sum()
-        balance = total_in - total_out
+    # 合并 + 计算余额
+    df_daily = df_income.merge(df_expense, on='date', how='outer').fillna(0)
+    df_daily['expense'] = -df_daily['expense']  # 支出显示为负
+    df_daily['balance'] = (df_daily['income'] + df_daily['expense']).cumsum()  # 累计余额
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("总收入", f"¥ {total_in:,.2f}")
-        c2.metric("总支出", f"¥ {total_out:,.2f}")
-        c3.metric("当前余额", f"¥ {balance:,.2f}")
+    # ===== 折线图：收支趋势 + 余额 =====
+    st.subheader("📈 收支趋势与余额变化")
+    fig_line = px.line(
+        df_daily.melt(id_vars='date', value_vars=['income', 'expense', 'balance'],
+                      var_name='类型', value_name='金额'),
+        x='date',
+        y='金额',
+        color='类型',
+        markers=True,
+        title="每日收支与累计余额",
+        labels={'date': '日期', '金额': '金额（元）'},
+        height=500,
+        color_discrete_map={
+            'income': '#28a745',   # 绿色收入
+            'expense': '#dc3545', # 红色支出
+            'balance': '#007bff'  # 蓝色余额
+        }
+    )
+    fig_line.update_traces(line=dict(width=3))
+    st.plotly_chart(fig_line, use_container_width=True)
 
-    st.markdown("---")
-
-    # -----------------------------
-    # 完整性验证
-    # -----------------------------
-    st.markdown("### 🔍 安全验证")
-    if st.button("🔍 立即验证账本完整性", key=f"{NS}_validate"):
-        with st.spinner("正在逐块校验..."):
-            if ledger.is_intact():
-                st.success("✅ 账本完整：所有区块哈希匹配，未发现篡改！")
-            else:
-                st.error("💥 警告：账本已被篡改！请立即审计数据源！")
-
-    # -----------------------------
-    # 数据导出（只读）
-    # -----------------------------
-    if not df.empty:
-        csv = df.to_csv(index=False)
-        st.download_button(
-            label="📤 导出账本（CSV，仅查看用）",
-            data=csv,
-            file_name=f"ledger_export_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-            mime="text/csv",
-            key=f"{NS}_export_csv"
+    # ===== 饼图：支出分类 =====
+    expense_data = df[df['trans_type'] == 'expense']
+    if not expense_data.empty:
+        st.subheader("📉 支出分类占比")
+        expense_by_cat = expense_data.groupby('category')['daily_total'].sum().abs().reset_index()
+        expense_by_cat = expense_by_cat.sort_values('daily_total', ascending=False)
+        fig_pie_expense = px.pie(
+            expense_by_cat,
+            names='category',
+            values='daily_total',
+            title='支出分类占比',
+            hole=0.4,
+            height=400
         )
+        st.plotly_chart(fig_pie_expense, use_container_width=True)
 
-    st.caption("💡 提示：即使手动修改 JSON 文件中的金额，验证功能也会立刻发现哈希断裂。")
+    # ===== 饼图：收入分类（可选）=====
+    income_data = df[df['trans_type'] == 'income']
+    if not income_data.empty:
+        st.subheader("💹 收入来源占比")
+        income_by_source = income_data.groupby('category')['daily_total'].sum().reset_index()
+        income_by_source = income_by_source.sort_values('daily_total', ascending=False)
+        fig_pie_income = px.pie(
+            income_by_source,
+            names='category',
+            values='daily_total',
+            title='收入分类占比',
+            hole=0.4,
+            height=400
+        )
+        st.plotly_chart(fig_pie_income, use_container_width=True)
+
+
+# -----------------------------
+# Streamlit 主函数
+# -----------------------------
+def run():
+    st.set_page_config(page_title="🏗️ 建筑单位现金账目系统", layout="wide")
+    init_db()
+
+    if "ledger_role" not in st.session_state:
+        _show_role_selector()
+    else:
+        _show_main_app()
+
+
+def _show_role_selector():
+    st.title("🏗️ 建筑单位现金账目系统")
+    st.markdown("请选择您的角色进入系统 👇")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("📒 出纳", use_container_width=True, type="primary"):
+            st.session_state.ledger_role = "cashier"
+            st.session_state.user_id = get_user_id_by_role("cashier")
+            st.rerun()
+    with col2:
+        if st.button("👔 领导", use_container_width=True, type="primary"):
+            st.session_state.ledger_role = "approver"
+            st.session_state.user_id = get_user_id_by_role("approver")
+            st.rerun()
+
+    st.markdown("---")
+    st.info("💡 出纳：录入收支记录，大额自动提交审批\n💡 领导：审批大额支出，查看全部账目 + 可视化分析")
+
+
+def _show_main_app():
+    role = st.session_state.ledger_role
+    user_id = st.session_state.user_id
+
+    # 主界面顶部：标题 + 切换角色按钮
+    col_title, col_switch = st.columns([4, 1])
+    with col_title:
+        st.title(f"🏗️ 建筑单位现金账目系统 - {'出纳' if role == 'cashier' else '领导'}")
+    with col_switch:
+        st.write("")  # 微调垂直对齐
+        st.write("")
+        if st.button("🔄 切换角色", use_container_width=True, type="secondary"):
+            for key in ["ledger_role", "user_id"]:
+                st.session_state.pop(key, None)
+            st.rerun()
+
+    st.markdown("---")
+
+    if role == "cashier":
+        _show_cashier_ui(user_id)
+    else:
+        _show_approver_ui(user_id)
+        st.markdown("---")
+        _show_approver_charts(user_id)
+
+    st.markdown("---")
+    _show_transaction_list(role, user_id)
+
+
+def _show_cashier_ui(cashier_id):
+    st.header("📝 录入新交易")
+
+    with st.form("new_transaction"):
+        col1, col2 = st.columns(2)
+        with col1:
+            source = st.text_input("💰 资金来源*", placeholder="如：甲方拨款、银行贷款、项目回款等")
+        with col2:
+            description = st.text_input("📌 用途描述*", placeholder="如：购买钢筋、支付工资等")
+
+        col3, col4, col5 = st.columns(3)
+        with col3:
+            trans_type = st.selectbox("📊 类型", ["income", "expense"], format_func=lambda x: "收入" if x == "income" else "支出")
+        with col4:
+            amount = st.number_input("💵 金额*", min_value=0.01, step=0.01, format="%.2f")
+            if trans_type == "expense":
+                amount = -amount
+        with col5:
+            category = st.text_input("🏷️ 分类", placeholder="如：材料、工资、差旅")
+
+        submitted = st.form_submit_button("💾 保存交易", type="primary")
+
+        if submitted:
+            if not source.strip():
+                st.error("请填写资金来源")
+            elif not description.strip():
+                st.error("请填写用途描述")
+            else:
+                trans_id = create_transaction(description, source, amount, category, trans_type, cashier_id)
+                if trans_id:
+                    need_approval = abs(amount) >= 100000
+                    if need_approval:
+                        st.warning(f"⚠️ 金额 ¥{abs(amount):,.2f} ≥ 10万元，已自动提交领导审批！")
+                    else:
+                        st.success("✅ 交易已保存！")
+                    st.balloons()
+
+
+def _show_approver_ui(approver_id):
+    st.header("📬 待审批交易（≥10万元）")
+    pending = get_pending_transactions()
+    if not pending:
+        st.info("🎉 暂无待审批交易")
+    else:
+        for trans in pending:
+            with st.expander(f"ID {trans['id']}: {trans['description']} ({'收入' if trans['amount'] > 0 else '支出'} ¥{abs(trans['amount']):,.2f})"):
+                st.write(f"**资金来源**: {trans['source']}")
+                st.write(f"**用途**: {trans['description']}")
+                st.write(f"**分类**: {trans['category'] or '—'}")
+                st.write(f"**出纳**: {trans['cashier_name']}")
+                st.write(f"**时间**: {trans['created_at']}")
+                if st.button(f"✅ 批准此笔 (ID: {trans['id']})", key=f"approve_{trans['id']}", type="primary"):
+                    if approve_transaction(trans['id'], approver_id):
+                        st.success("✅ 已批准！")
+                        st.rerun()
+
+
+def _show_transaction_list(user_role, user_id):
+    st.header("📋 所有交易记录")
+    transactions = get_all_transactions(user_role, user_id)
+    if not transactions:
+        st.info("暂无交易记录")
+        return
+
+    total_income = sum(t['amount'] for t in transactions if t['amount'] > 0)
+    total_expense = abs(sum(t['amount'] for t in transactions if t['amount'] < 0))
+    balance = total_income - total_expense
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("💰 总收入", f"¥{total_income:,.2f}")
+    col2.metric("💸 总支出", f"¥{total_expense:,.2f}")
+    col3.metric("📊 当前结余", f"¥{balance:,.2f}")
+
+    display_data = []
+    for t in transactions:
+        display_data.append({
+            "ID": t["id"],
+            "时间": t["created_at"].strftime("%Y-%m-%d %H:%M"),
+            "资金来源": t["source"],
+            "用途": t["description"],
+            "分类": t["category"] or "—",
+            "类型": "收入" if t["amount"] > 0 else "支出",
+            "金额": f"¥{abs(t['amount']):,.2f}",
+            "状态": "🟢 已批" if t["approved"] else ("🟡 待批" if t["need_approval"] else "⚪ 无需审批"),
+            "出纳": t["cashier_name"],
+            "审批人": t["approver_name"] or "—"
+        })
+
+    st.dataframe(display_data, use_container_width=True, hide_index=True)
+
+
+# -----------------------------
+# 入口点
+# -----------------------------
+if __name__ == "__main__":
+    run()
