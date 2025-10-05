@@ -155,6 +155,7 @@ def initialize_database():
         cur.execute("SELECT 1 FROM pg_type WHERE typname = 'movement_type_shiwa';")
         if not cur.fetchone():
             cur.execute("CREATE TYPE movement_type_shiwa AS ENUM ('transfer', 'purchase', 'hatch');")
+            cur.execute("ALTER TYPE movement_type_shiwa ADD VALUE IF NOT EXISTS 'sale';")
 
         if not table_exists(cur, 'stock_movement_shiwa'):
             cur.execute("""
