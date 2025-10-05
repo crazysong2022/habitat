@@ -1,4 +1,3 @@
-# projects/your_project/main.py
 import streamlit as st
 import os
 import json
@@ -15,7 +14,7 @@ load_dotenv()
 
 def get_ai_client():
     api_key = os.getenv("DASHSCOPE_API_KEY")
-    base_url = os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1").strip()
+    base_url = os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1 ").strip()
     if not api_key:
         st.error("❌ 请在 .env 中设置 DASHSCOPE_API_KEY")
         st.stop()
@@ -186,130 +185,250 @@ def generate_natural_answer(user_question: str, sql: str, result_df: pd.DataFram
         temperature=0.3
     )
     return response.choices[0].message.content.strip()
+# -----------------------------
+# 文件数据源支持（Excel/CSV）
+# -----------------------------
 
+def load_dataframe_from_file(uploaded_file):
+    """安全加载用户上传的 Excel/CSV 文件为 DataFrame"""
+    try:
+        if uploaded_file.name.endswith('.csv'):
+            df = pd.read_csv(uploaded_file)
+        elif uploaded_file.name.endswith(('.xlsx', '.xls')):
+            df = pd.read_excel(uploaded_file)
+        else:
+            return None, "❌ 仅支持 .csv, .xlsx, .xls 文件"
+        return df, None
+    except Exception as e:
+        return None, f"❌ 文件解析失败: {str(e)}"
+
+def get_file_schema(df: pd.DataFrame):
+    """从 DataFrame 提取 schema 供 AI 使用"""
+    schema = {}
+    # 假设整个文件是一个“表”，命名为 'uploaded_data'
+    schema["uploaded_data"] = [
+        {"column": col, "type": str(df[col].dtype)}
+        for col in df.columns
+    ]
+    return schema
+def ask_ai_answer_from_file(user_question: str, schema_info: dict, sample_data: str):
+    """让 AI 直接基于 schema 和数据样本回答问题，不生成 SQL"""
+    client = get_ai_client()
+    
+    system_prompt = f"""
+你是一个专业的数据分析师。用户上传了一个数据文件，结构如下：
+
+表名：uploaded_data
+{json.dumps(schema_info, indent=2, ensure_ascii=False)}
+
+以下是前 5 行数据样本（用制表符分隔）：
+{sample_data}
+
+请根据用户的原始问题，直接用中文给出简洁、准确的自然语言回答。
+- 不要提“SQL”、“查询”、“表”等技术术语
+- 如果数据不足以回答，请说“数据中未找到相关信息”或“需要更多信息”
+- 回答要友好、专业、面向业务决策
+"""
+
+    response = client.chat.completions.create(
+        model="qwen-plus",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_question}
+        ],
+        temperature=0.3
+    )
+    return response.choices[0].message.content.strip()
 # -----------------------------
 # 主应用
 # -----------------------------
 def run():
     st.title("🤖 AI 领导决策助手")
-    st.caption("支持 PostgreSQL / MySQL / SQLite / Oracle ")
+    st.caption("支持 PostgreSQL / MySQL / SQLite / Oracle / Excel / CSV")
 
-    # 1. 选择数据库类型
-    db_type_name = st.selectbox("1️⃣ 选择数据库类型", list(DB_TYPES.keys()))
-    db_type = DB_TYPES[db_type_name]
+    # 选择数据源类型：数据库 or 文件
+    data_source = st.radio(
+        "选择数据源类型",
+        ("数据库", "Excel/CSV 文件"),
+        horizontal=True
+    )
 
-    # 2. 配置连接
-    config = {}
-    if db_type == "sqlite":
-        uploaded_file = st.file_uploader("2️⃣ 上传 SQLite 文件 (.db, .sqlite)", type=["db", "sqlite"])
-        if uploaded_file:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
-                tmp.write(uploaded_file.getvalue())
-                config["file_path"] = tmp.name
-    else:
-        config["host"] = st.text_input("主机 (Host)", value="localhost")
-        default_port = {"postgresql": 5432, "mysql": 3306, "oracle": 1521}
-        config["port"] = st.number_input("端口 (Port)", value=default_port[db_type], min_value=1, max_value=65535)
-        if db_type != "oracle":
-            config["database"] = st.text_input("数据库名 (Database)")
+    if data_source == "数据库":
+        # ========== 原有数据库逻辑（完全保留） ==========
+        db_type_name = st.selectbox("1️⃣ 选择数据库类型", list(DB_TYPES.keys()))
+        db_type = DB_TYPES[db_type_name]
+
+        config = {}
+        if db_type == "sqlite":
+            uploaded_file = st.file_uploader("2️⃣ 上传 SQLite 文件 (.db, .sqlite)", type=["db", "sqlite"])
+            if uploaded_file:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+                    tmp.write(uploaded_file.getvalue())
+                    config["file_path"] = tmp.name
         else:
-            config["service_name"] = st.text_input("服务名 (Service Name)")
-        config["user"] = st.text_input("用户名 (User)")
-        config["password"] = st.text_input("密码 (Password)", type="password")
-
-    # 3. 测试连接
-    if st.button("🧪 测试连接"):
-        if db_type == "sqlite" and "file_path" not in config:
-            st.error("请先上传 SQLite 文件")
-        elif db_type != "sqlite" and not all(
-            config.get(k) for k in ["host", "port", "user", "password"] 
-            if k in config
-        ):
-            st.error("请填写所有必要字段")
-        else:
-            success, msg = test_database_connection(db_type, config)
-            if success:
-                st.success(msg)
-                st.session_state.db_config = config
-                st.session_state.db_type = db_type
+            config["host"] = st.text_input("主机 (Host)", value="localhost")
+            default_port = {"postgresql": 5432, "mysql": 3306, "oracle": 1521}
+            config["port"] = st.number_input("端口 (Port)", value=default_port[db_type], min_value=1, max_value=65535)
+            if db_type != "oracle":
+                config["database"] = st.text_input("数据库名 (Database)")
             else:
-                st.error(msg)
+                config["service_name"] = st.text_input("服务名 (Service Name)")
+            config["user"] = st.text_input("用户名 (User)")
+            config["password"] = st.text_input("密码 (Password)", type="password")
 
-    # 4. AI 助手
-    if "db_config" in st.session_state:
-        st.markdown("---")
-        st.subheader("💬 问任何关于你数据的问题")
+        if st.button("🧪 测试连接"):
+            if db_type == "sqlite" and "file_path" not in config:
+                st.error("请先上传 SQLite 文件")
+            elif db_type != "sqlite" and not all(
+                config.get(k) for k in ["host", "port", "user", "password"] 
+                if k in config
+            ):
+                st.error("请填写所有必要字段")
+            else:
+                success, msg = test_database_connection(db_type, config)
+                if success:
+                    st.success(msg)
+                    st.session_state.db_config = config
+                    st.session_state.db_type = db_type
+                    st.session_state.data_mode = "database"
+                else:
+                    st.error(msg)
 
-        schema = get_db_schema(st.session_state.db_type, st.session_state.db_config)
-        if not schema:
-            st.warning("无法加载数据结构")
-            return
+        # AI 助手（数据库模式）
+        if "db_config" in st.session_state and st.session_state.get("data_mode") == "database":
+            st.markdown("---")
+            st.subheader("💬 问任何关于你数据的问题")
 
-        if "ai_chat" not in st.session_state:
-            st.session_state.ai_chat = []
+            schema = get_db_schema(st.session_state.db_type, st.session_state.db_config)
+            if not schema:
+                st.warning("无法加载数据结构")
+                return
 
-        # 显示历史
-        for msg in st.session_state.ai_chat:
-            with st.chat_message("user"):
-                st.markdown(msg["user"])
-            with st.chat_message("assistant"):
-                st.markdown(msg["answer"])
-                if "sql" in msg:
+            if "ai_chat" not in st.session_state:
+                st.session_state.ai_chat = []
+
+            # 显示历史
+            for msg in st.session_state.ai_chat:
+                with st.chat_message("user"):
+                    st.markdown(msg["user"])
+                with st.chat_message("assistant"):
+                    st.markdown(msg["answer"])
+                    if "sql" in msg:
+                        with st.expander("🔍 技术详情"):
+                            st.code(msg["sql"], language="sql")
+                            st.dataframe(msg["df"], use_container_width=True)
+
+            # 用户输入
+            if prompt := st.chat_input("例如：最近利润最高的销售是哪笔？"):
+                with st.chat_message("user"):
+                    st.markdown(prompt)
+
+                with st.chat_message("assistant"):
+                    with st.spinner("🧠 AI 正在分析数据..."):
+                        ai_sql_result = ask_ai_generate_sql(prompt, schema)
+                        if "error" in ai_sql_result:
+                            st.error(ai_sql_result["error"])
+                            st.session_state.ai_chat.append({
+                                "user": prompt,
+                                "answer": ai_sql_result["error"],
+                                "sql": None,
+                                "df": None
+                            })
+                            st.stop()
+
+                        sql = ai_sql_result["sql"]
+                        df, exec_error = execute_safe_query(st.session_state.db_type, st.session_state.db_config, sql)
+                        if exec_error:
+                            st.error(exec_error)
+                            st.session_state.ai_chat.append({
+                                "user": prompt,
+                                "answer": exec_error,
+                                "sql": sql,
+                                "df": None
+                            })
+                            st.stop()
+
+                        natural_answer = generate_natural_answer(prompt, sql, df)
+
+                    st.markdown(natural_answer)
+
                     with st.expander("🔍 技术详情"):
-                        st.code(msg["sql"], language="sql")
-                        st.dataframe(msg["df"], use_container_width=True)
+                        st.code(sql, language="sql")
+                        st.dataframe(df, use_container_width=True)
 
-        # 用户输入
-        if prompt := st.chat_input("例如：最近利润最高的销售是哪笔？"):
-            with st.chat_message("user"):
-                st.markdown(prompt)
+                    st.session_state.ai_chat.append({
+                        "user": prompt,
+                        "answer": natural_answer,
+                        "sql": sql,
+                        "df": df
+                    })
 
-            with st.chat_message("assistant"):
-                with st.spinner("🧠 AI 正在分析数据..."):
-                    # 阶段1: 生成 SQL
-                    ai_sql_result = ask_ai_generate_sql(prompt, schema)
-                    if "error" in ai_sql_result:
-                        st.error(ai_sql_result["error"])
-                        st.session_state.ai_chat.append({
-                            "user": prompt,
-                            "answer": ai_sql_result["error"],
-                            "sql": None,
-                            "df": None
-                        })
-                        st.stop()
+            if st.button("🗑️ 清除对话"):
+                st.session_state.ai_chat = []
+                st.rerun()
 
-                    sql = ai_sql_result["sql"]
-                    # 阶段2: 执行
-                    df, exec_error = execute_safe_query(st.session_state.db_type, st.session_state.db_config, sql)
-                    if exec_error:
-                        st.error(exec_error)
-                        st.session_state.ai_chat.append({
-                            "user": prompt,
-                            "answer": exec_error,
-                            "sql": sql,
-                            "df": None
-                        })
-                        st.stop()
+    else:
+        # ========== 新增：Excel/CSV 文件模式 ==========
+        st.subheader("📁 上传你的 Excel 或 CSV 文件")
+        uploaded_file = st.file_uploader(
+            "上传数据文件",
+            type=["csv", "xlsx", "xls"],
+            help="支持 .csv, .xlsx, .xls 格式"
+        )
 
-                    # 阶段3: 生成自然语言回答
-                    natural_answer = generate_natural_answer(prompt, sql, df)
+        if uploaded_file:
+            df, error = load_dataframe_from_file(uploaded_file)
+            if error:
+                st.error(error)
+            else:
+                st.success(f"✅ 成功加载 {len(df)} 行数据")
+                st.session_state.file_df = df
+                st.session_state.data_mode = "file"
 
-                st.markdown(natural_answer)
+                with st.expander("📊 数据预览（前 5 行）"):
+                    st.dataframe(df.head(), use_container_width=True)
 
-                # 显示技术详情
-                with st.expander("🔍 技术详情"):
-                    st.code(sql, language="sql")
-                    st.dataframe(df, use_container_width=True)
+        # AI 助手（文件模式）
+        if "file_df" in st.session_state and st.session_state.get("data_mode") == "file":
+            st.markdown("---")
+            st.subheader("💬 问任何关于你数据的问题")
 
-                # 保存到历史
-                st.session_state.ai_chat.append({
-                    "user": prompt,
-                    "answer": natural_answer,
-                    "sql": sql,
-                    "df": df
-                })
+            df = st.session_state.file_df
+            schema = get_file_schema(df)
+            # 只取前 10 行作为样本，避免 token 超限
+            sample_data = df.head(10).to_csv(sep='\t', index=False)
 
-        st.markdown("---")
-        if st.button("🗑️ 清除对话"):
-            st.session_state.ai_chat = []
-            st.rerun()
+            if "ai_chat_file" not in st.session_state:
+                st.session_state.ai_chat_file = []
+
+            # 显示历史
+            for msg in st.session_state.ai_chat_file:
+                with st.chat_message("user"):
+                    st.markdown(msg["user"])
+                with st.chat_message("assistant"):
+                    st.markdown(msg["answer"])
+                    if "df_preview" in msg:
+                        with st.expander("🔍 相关数据"):
+                            st.dataframe(msg["df_preview"], use_container_width=True)
+
+            # 用户输入
+            if prompt := st.chat_input("例如：销售额最高的产品是什么？"):
+                with st.chat_message("user"):
+                    st.markdown(prompt)
+
+                with st.chat_message("assistant"):
+                    with st.spinner("🧠 AI 正在分析数据..."):
+                        answer = ask_ai_answer_from_file(prompt, schema, sample_data)
+
+                    st.markdown(answer)
+
+                    # 保存对话（可附带完整数据或片段用于展示）
+                    st.session_state.ai_chat_file.append({
+                        "user": prompt,
+                        "answer": answer,
+                        "df_preview": df.head(10)  # 或根据问题动态筛选，MVP 用 head
+                    })
+
+            if st.button("🗑️ 清除对话（文件模式）"):
+                st.session_state.ai_chat_file = []
+                st.rerun()
