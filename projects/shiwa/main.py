@@ -86,7 +86,6 @@ def initialize_database():
             """)
             st.toast("✅ 创建池塘类型表", icon="🏞️")
 
-        # 🔽 无论表是否已存在，都补插缺失的默认类型
         for name, desc in [
             ('种蛙池', '用于繁殖的成年种蛙'),
             ('孵化池', '用于孵化卵或外购蝌蚪'),
@@ -129,7 +128,7 @@ def initialize_database():
                     name VARCHAR(50) NOT NULL UNIQUE,
                     unit_price DECIMAL(10,2) NOT NULL DEFAULT 0.00
                 );
-                INSERT INTO feed_type_shiwa (name, unit_price) VALUES 
+                INSERT INTO feed_type_shiwa (name, unit_price) VALUES
                 ('饲料', 10.00),
                 ('大面包虫', 30.00),
                 ('小面包虫', 20.00);
@@ -152,10 +151,10 @@ def initialize_database():
             """)
             st.toast("✅ 创建喂养记录表", icon="🍽️")
 
-        # 6. stock_movement_shiwa 及触发器
-        cur.execute("SELECT EXISTS(SELECT 1 FROM pg_type WHERE typname = 'movement_type_shiwa');")
-        if not cur.fetchone()[0]:
-            cur.execute("CREATE TYPE movement_type_shiwa AS ENUM ('transfer', 'purchase');")
+        # 6. stock_movement_shiwa 及枚举、约束、触发器
+        cur.execute("SELECT 1 FROM pg_type WHERE typname = 'movement_type_shiwa';")
+        if not cur.fetchone():
+            cur.execute("CREATE TYPE movement_type_shiwa AS ENUM ('transfer', 'purchase', 'hatch');")
 
         if not table_exists(cur, 'stock_movement_shiwa'):
             cur.execute("""
@@ -163,59 +162,74 @@ def initialize_database():
                     id SERIAL PRIMARY KEY,
                     movement_type movement_type_shiwa NOT NULL,
                     from_pond_id INT REFERENCES pond_shiwa(id) ON DELETE SET NULL,
-                    to_pond_id INT NOT NULL REFERENCES pond_shiwa(id) ON DELETE RESTRICT,
+                    to_pond_id   INT REFERENCES pond_shiwa(id) ON DELETE RESTRICT,
                     quantity INT NOT NULL CHECK (quantity > 0),
                     description TEXT,
                     moved_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-                    CONSTRAINT chk_movement_from CHECK (
-                        (movement_type = 'transfer' AND from_pond_id IS NOT NULL) OR
-                        (movement_type = 'purchase' AND from_pond_id IS NULL)
-                    )
+                    unit_price DECIMAL(8,2)
                 );
             """)
-            st.toast("✅ 创建转池/外购记录表", icon="🔄")
-            cur.execute("""
-                ALTER TABLE stock_movement_shiwa 
-                ADD COLUMN IF NOT EXISTS unit_price DECIMAL(8,2);
-            """)
-            st.toast("✅ 为外购记录添加单价字段（如有）", icon="💰")
+            st.toast("✅ 创建转池/外购/孵化记录表", icon="🔄")
 
+        # -------------- 检查约束升级（hatch 合法）--------------
         cur.execute("""
-            CREATE OR REPLACE FUNCTION check_same_frog_type_shiwa()
-            RETURNS TRIGGER AS $$
-            DECLARE
-                from_frog INT;
-                to_frog   INT;
-            BEGIN
-                -- 外购 或 销售 都不需要检查
-                IF NEW.movement_type IN ('purchase', 'sale') THEN
-                    RETURN NEW;
-                END IF;
+        DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_constraint
+                       WHERE conname = 'chk_movement_from'
+                         AND contype = 'c'
+                         AND pg_get_constraintdef(oid) NOT LIKE '%hatch%') THEN
+                ALTER TABLE stock_movement_shiwa DROP CONSTRAINT chk_movement_from;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_movement_from') THEN
+                ALTER TABLE stock_movement_shiwa
+                ADD CONSTRAINT chk_movement_from CHECK (
+                    (movement_type = 'transfer' AND from_pond_id IS NOT NULL) OR
+                    (movement_type = 'purchase' AND from_pond_id IS NULL) OR
+                    (movement_type = 'hatch'    AND from_pond_id IS NULL)
+                );
+            END IF;
+        END $$;
+        """)
 
-                -- 以下仅对 transfer 做检查
-                SELECT frog_type_id INTO from_frog FROM pond_shiwa WHERE id = NEW.from_pond_id;
-                SELECT frog_type_id INTO to_frog   FROM pond_shiwa WHERE id = NEW.to_pond_id;
-
-                IF from_frog IS NULL OR to_frog IS NULL THEN
-                    RAISE EXCEPTION '源池或目标池不存在';
-                END IF;
-                IF from_frog != to_frog THEN
-                    RAISE EXCEPTION '转池失败：源池与目标池蛙种不同（源:% → 目标:%）', from_frog, to_frog;
-                END IF;
-
+        # -------------- 触发器函数：对 hatch 完全放行 --------------
+        cur.execute("""
+        CREATE OR REPLACE FUNCTION check_same_frog_type_shiwa()
+        RETURNS TRIGGER AS $$
+        DECLARE
+            from_frog INT;
+            to_frog   INT;
+        BEGIN
+            /* 完全放行 */
+            IF NEW.movement_type IN ('purchase','hatch','sale') THEN
                 RETURN NEW;
-            END;
-            $$ LANGUAGE plpgsql;
-        """)
-        cur.execute("""
-            DROP TRIGGER IF EXISTS trg_check_same_frog_type_shiwa ON stock_movement_shiwa;
-            CREATE TRIGGER trg_check_same_frog_type_shiwa
-            BEFORE INSERT OR UPDATE ON stock_movement_shiwa
-            FOR EACH ROW EXECUTE FUNCTION check_same_frog_type_shiwa();
-        """)
-        st.toast("✅ 创建蛙种一致性触发器", icon="🛡️")
+            END IF;
 
-        # 7. 客户表
+            /* 以下仅对 transfer 检查蛙种一致性 */
+            SELECT frog_type_id INTO from_frog FROM pond_shiwa WHERE id = NEW.from_pond_id;
+            SELECT frog_type_id INTO to_frog   FROM pond_shiwa WHERE id = NEW.to_pond_id;
+
+            IF from_frog IS NULL OR to_frog IS NULL THEN
+                RAISE EXCEPTION '源池或目标池不存在';
+            END IF;
+            IF from_frog != to_frog THEN
+                RAISE EXCEPTION '转池失败：源池与目标池蛙种不同（源:% → 目标:%）', from_frog, to_frog;
+            END IF;
+
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        """)
+
+        cur.execute("""
+        DROP TRIGGER IF EXISTS trg_check_same_frog_type_shiwa ON stock_movement_shiwa;
+        CREATE TRIGGER trg_check_same_frog_type_shiwa
+        BEFORE INSERT OR UPDATE ON stock_movement_shiwa
+        FOR EACH ROW EXECUTE FUNCTION check_same_frog_type_shiwa();
+        """)
+        st.toast("✅ 蛙种一致性触发器已升级（hatch 放行）", icon="🛡️")
+
+        # 7. customer_shiwa
         if not table_exists(cur, 'customer_shiwa'):
             cur.execute("""
                 CREATE TABLE customer_shiwa (
@@ -228,7 +242,7 @@ def initialize_database():
             """)
             st.toast("✅ 创建客户表", icon="👤")
 
-        # 8. 销售记录表
+        # 8. sale_record_shiwa
         if not table_exists(cur, 'sale_record_shiwa'):
             cur.execute("""
                 CREATE TABLE sale_record_shiwa (
@@ -909,11 +923,10 @@ def run():
         return pid_pick
 
 
-    # ----------------------------- ③ 替换原选择逻辑 -----------------------------
-    # ----------------------------- Tab 4: 转池与外购 -----------------------------
+    # ----------------------------- Tab 4: 转池 · 外购 · 孵化 -----------------------------
     with tab4:
-        st.subheader("🔄 转池或外购操作")
-        operation = st.radio("操作类型", ["转池", "外购"], horizontal=True, key="op_type")
+        st.subheader("🔄 转池 / 外购 / 孵化操作")
+        operation = st.radio("操作类型", ["转池", "外购", "孵化"], horizontal=True, key="op_type")
 
         ponds = get_all_ponds()
         if not ponds:
@@ -927,23 +940,31 @@ def run():
 
         grouped = group_ponds_by_type(pond_id_to_info)
 
-        # 初始化变量
-        from_pond_id = None
-        to_pond_id = None
-        purchase_price = None  # 仅外购时使用
+        # 默认值
+        from_pond_id   = None
+        to_pond_id     = None
+        purchase_price = None
 
+        # ① 外购 ----------------------------------------------------------
         if operation == "外购":
             to_pond_id = pond_selector("目标池塘", pond_id_to_info, grouped, "purchase")
             purchase_price = st.number_input(
                 "外购单价 (元/只)",
-                min_value=0.1,
-                value=20.0,
-                step=1.0,
-                format="%.2f",
+                min_value=0.1, value=20.0, step=1.0, format="%.2f",
                 help="请输入每只蛙的采购价格"
             )
-        else:  # 转池
-            # 源池：只列出可转出类型
+
+        # ② 孵化 ----------------------------------------------------------
+        elif operation == "孵化":
+            hatch_grouped = {k: v for k, v in grouped.items() if k == "孵化池"}
+            if not hatch_grouped:
+                st.error("❌ 请先至少创建一个‘孵化池’")
+                st.stop()
+            to_pond_id = pond_selector("孵化池", pond_id_to_info, hatch_grouped, "hatch")
+            purchase_price = None  # 孵化无成本
+
+        # ③ 转池 ----------------------------------------------------------
+        else:  # operation == "转池"
             src_grouped = {k: v for k, v in grouped.items() if k in TRANSFER_PATH_RULES}
             if not src_grouped:
                 st.error("❌ 无可用的转出池类型")
@@ -952,17 +973,18 @@ def run():
 
             live_info = pond_id_to_info[from_pond_id]
             allowed = TRANSFER_PATH_RULES.get(live_info["pond_type"], [])
-
             tgt_grouped = {k: v for k, v in grouped.items() if k in allowed and v}
             if not tgt_grouped:
                 st.error("❌ 无合法目标池")
                 st.stop()
             to_pond_id = pond_selector("目标池塘（转入）", pond_id_to_info, tgt_grouped, "transfer_tgt")
+            purchase_price = None
 
         # 公共输入
         quantity = st.number_input("数量", min_value=1, value=100, step=10)
-        description = st.text_input("操作描述", placeholder="如：产卵转出 / 外购幼蛙")
+        description = st.text_input("操作描述", placeholder="如：产卵转出 / 外购幼蛙 / 自孵蝌蚪")
 
+        # 提交按钮
         if st.button(f"✅ 执行{operation}", type="primary"):
             try:
                 to_pond = get_pond_by_id(to_pond_id)
@@ -976,15 +998,14 @@ def run():
                         st.error(f"❌ 源池「{from_pond[1]}」数量不足！当前只有 {from_pond[4]} 只。")
                         st.stop()
 
-                movement_type = 'transfer' if operation == "转池" else 'purchase'
-                # 传入 unit_price：外购时有值，转池时为 None
+                movement_type = {'转池':'transfer', '外购':'purchase', '孵化':'hatch'}[operation]
                 add_stock_movement(
                     movement_type=movement_type,
                     from_pond_id=from_pond_id,
                     to_pond_id=to_pond_id,
                     quantity=quantity,
                     description=description or f"{operation} {quantity} 只",
-                    unit_price=purchase_price if operation == "外购" else None
+                    unit_price=purchase_price
                 )
                 st.success(f"✅ {operation}成功！")
                 st.rerun()
@@ -992,21 +1013,16 @@ def run():
             except Exception as e:
                 st.error(f"❌ 操作失败: {e}")
 
+        # 最近记录
         st.markdown("---")
-        st.subheader("📋 最近转池 / 外购记录")
-
+        st.subheader("📋 最近转池 / 外购 / 孵化记录")
         records = get_recent_movements(15)
         if not records:
             st.info("暂无操作记录")
         else:
             import pandas as pd
-            df_log = pd.DataFrame(
-                records,
-                columns=["ID", "类型", "源池", "目标池", "数量", "描述", "时间"]
-            )
-            # 注意：get_recent_movements 查询中未包含单价，如需显示，需修改该函数
+            df_log = pd.DataFrame(records, columns=["ID", "类型", "源池", "目标池", "数量", "描述", "时间"])
             st.dataframe(df_log, use_container_width=True, hide_index=True)
-
             csv = df_log.to_csv(index=False)
             st.download_button(
                 label="📥 导出 CSV",
