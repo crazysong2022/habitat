@@ -3,6 +3,7 @@ import streamlit as st
 import os
 from urllib.parse import urlparse
 import psycopg2
+from datetime import datetime, time
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 from dotenv import load_dotenv
 
@@ -119,7 +120,20 @@ def initialize_database():
                 );
             """)
             st.toast("✅ 创建池塘实例表", icon="🏠")
-
+            # 在 initialize_database() 的 pond_shiwa 创建之后加上：
+            cur.execute("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1
+                        FROM information_schema.constraint_column_usage
+                        WHERE table_name = 'pond_shiwa'
+                        AND constraint_name = 'unique_pond_name'
+                    ) THEN
+                        ALTER TABLE pond_shiwa ADD CONSTRAINT unique_pond_name UNIQUE (name);
+                    END IF;
+                END $$;
+            """)
         # 4. feed_type_shiwa
         if not table_exists(cur, 'feed_type_shiwa'):
             cur.execute("""
@@ -395,14 +409,16 @@ def get_all_ponds():
     return rows
 
 
-def add_feeding_record(pond_id, feed_type_id, weight_kg, unit_price, notes):
+def add_feeding_record(pond_id, feed_type_id, weight_kg, unit_price, notes, fed_at=None):
+    """fed_at 若留空则取 now()"""
+    fed_at = fed_at or datetime.utcnow()
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO feeding_record_shiwa (pond_id, feed_type_id, feed_weight_kg, unit_price_at_time, notes)
-        VALUES (%s, %s, %s, %s, %s);
-    """, (pond_id, feed_type_id, weight_kg, unit_price, notes))
-    # 更新池子最后操作时间（可选）
+        INSERT INTO feeding_record_shiwa
+        (pond_id, feed_type_id, feed_weight_kg, unit_price_at_time, notes, fed_at)
+        VALUES (%s, %s, %s, %s, %s, %s);
+    """, (pond_id, feed_type_id, weight_kg, unit_price, notes, fed_at))
     conn.commit()
     cur.close()
     conn.close()
@@ -436,17 +452,26 @@ def get_frog_types():
     return rows
 
 def create_pond(name, pond_type_id, frog_type_id, max_capacity, initial_count=0):
-    """新建池塘，可指定初始数量"""
-    initial_count = max(0, min(initial_count, max_capacity))   # 双保险
+    initial_count = max(0, min(initial_count, max_capacity))
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO pond_shiwa (name, pond_type_id, frog_type_id, max_capacity, current_count)
-        VALUES (%s, %s, %s, %s, %s);
-    """, (name, pond_type_id, frog_type_id, max_capacity, initial_count))
-    conn.commit()
-    cur.close()
-    conn.close()
+    try:
+        # 👇 先检查重名
+        cur.execute("SELECT 1 FROM pond_shiwa WHERE name = %s;", (name.strip(),))
+        if cur.fetchone():
+            raise ValueError(f"池塘名称「{name}」已存在，请勿重复创建！")
+
+        cur.execute("""
+            INSERT INTO pond_shiwa (name, pond_type_id, frog_type_id, max_capacity, current_count)
+            VALUES (%s, %s, %s, %s, %s);
+        """, (name.strip(), pond_type_id, frog_type_id, max_capacity, initial_count))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        cur.close()
+        conn.close()
 
 
 def delete_all_test_data():
@@ -743,7 +768,7 @@ def run():
 
     # 创建三个 Tab
     tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
-    ["📊 池塘总览", "🍽️ 喂养记录", "➕ 池塘创建", "🔄 转池与外购", 
+    ["📊 池塘总览", "🍽️ 喂养日志", "➕ 池塘创建", "🔄 孵转池与外购", 
      "🪱 饲料类型", "💰 销售记录", "📈 投资回报（ROI）"]
 )
 
@@ -800,9 +825,9 @@ def run():
                 chart_data = filtered_df.set_index("名称")["占用率 (%)"]
                 st.bar_chart(chart_data, height=400)
 
-    # Tab 2: 喂养记录（保持不变）
+    # Tab 2: 喂养记录（录入 + 总览）
     with tab2:
-        st.subheader("添加喂养记录")
+        st.subheader("🍽️ 喂养日志")
         ponds = get_all_ponds()
         feed_types = get_feed_types()
 
@@ -811,26 +836,71 @@ def run():
         elif not feed_types:
             st.error("🪱 尚未配置任何饲料类型，请切换到【饲料类型】Tab 添加至少一种饲料。")
         else:
+            # —— 录入区域 ——
             with st.form("feeding_form"):
-                pond_id = st.selectbox(
-                    "选择池塘",
-                    options=[p[0] for p in ponds],
-                    format_func=lambda x: next(p[1] for p in ponds if p[0] == x)
-                )
-                feed_id = st.selectbox(
-                    "饲料类型",
-                    options=[f[0] for f in feed_types],
-                    format_func=lambda x: f"{next(f[1] for f in feed_types if f[0] == x)} (¥{next(f[2] for f in feed_types if f[0] == x)}/kg)"
-                )
+                c1, c2 = st.columns(2)
+                with c1:
+                    pond_id = st.selectbox(
+                        "选择池塘",
+                        options=[p[0] for p in ponds],
+                        format_func=lambda x: next(p[1] for p in ponds if p[0] == x)
+                    )
+                with c2:
+                    feed_id = st.selectbox(
+                        "饲料类型",
+                        options=[f[0] for f in feed_types],
+                        format_func=lambda x: f"{next(f[1] for f in feed_types if f[0] == x)} (¥{next(f[2] for f in feed_types if f[0] == x)}/kg)"
+                    )
                 weight = st.number_input("喂养重量 (kg)", min_value=0.1, step=0.1)
+
+                # 日期+时段
+                col_d, col_t = st.columns(2)
+                with col_d:
+                    feed_date = st.date_input("投喂日期", value=datetime.today())
+                with col_t:
+                    ampm = st.selectbox("时段", ["上午", "下午"])
+
                 notes = st.text_area("备注（可选）")
                 submitted = st.form_submit_button("✅ 提交喂养记录")
 
                 if submitted:
                     unit_price = next(f[2] for f in feed_types if f[0] == feed_id)
-                    add_feeding_record(pond_id, feed_id, weight, float(unit_price), notes)
+                    feed_dt = datetime.combine(feed_date, time(10 if ampm == "上午" else 15, 0))
+                    add_feeding_record(pond_id, feed_id, weight, float(unit_price), notes, feed_dt)
                     st.success("✅ 喂养记录已保存！")
                     st.rerun()
+
+                st.markdown("---")
+                st.subheader("📊 喂食总览")
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT
+                        DATE(fr.fed_at AT TIME ZONE 'UTC' AT TIME ZONE '+08') AS 日期,
+                        CASE WHEN EXTRACT(HOUR FROM fr.fed_at AT TIME ZONE 'UTC' AT TIME ZONE '+08') < 12
+                            THEN '上午'
+                            ELSE '下午'
+                        END AS 时段,
+                        ft.name         AS 蛙种,
+                        ftype.name      AS 饲料,
+                        SUM(fr.feed_weight_kg) AS 总重量kg,
+                        SUM(fr.total_cost)     AS 总成本
+                    FROM feeding_record_shiwa fr
+                    JOIN pond_shiwa p   ON fr.pond_id  = p.id
+                    JOIN frog_type_shiwa ft ON p.frog_type_id = ft.id
+                    JOIN feed_type_shiwa ftype ON fr.feed_type_id = ftype.id
+                    GROUP BY 日期, 时段, ft.name, ftype.name
+                    ORDER BY 日期 DESC, 时段;
+                """)
+                rows = cur.fetchall()
+                cur.close(); conn.close()
+
+                if rows:
+                    import pandas as pd
+                    df = pd.DataFrame(rows, columns=["日期", "时段", "蛙种", "饲料", "总重量kg", "总成本"])
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+                else:
+                    st.info("暂无喂养记录")
 
     with tab3:
         st.subheader("创建新池塘")
@@ -874,7 +944,10 @@ def run():
                         st.success(f"✅ 池塘「{name}」创建成功！容量：{max_cap}，初始数量：{initial}")
                         st.rerun()
                     except Exception as e:
-                        st.error(f"❌ 创建失败: {e}")
+                        if "unique_pond_name" in str(e) or "已存在" in str(e):
+                            st.error(f"❌ 创建失败：池塘名称「{name}」已存在，请换一个名称！")
+                        else:
+                            st.error(f"❌ 创建失败: {e}")
 
         st.markdown("---")
         st.subheader("🧪 开发辅助：一键初始化示例数据")
@@ -925,6 +998,7 @@ def run():
 
 
     # ----------------------------- Tab 4: 转池 · 外购 · 孵化 -----------------------------
+    # ----------------------------- Tab 4: 转池 · 外购 · 孵化 -----------------------------
     with tab4:
         st.subheader("🔄 转池 / 外购 / 孵化操作")
         operation = st.radio("操作类型", ["转池", "外购", "孵化"], horizontal=True, key="op_type")
@@ -932,107 +1006,116 @@ def run():
         ponds = get_all_ponds()
         if not ponds:
             st.warning("请先创建至少一个池塘！")
-            st.stop()
+            # ✅ 不用 st.stop()，直接跳过本 Tab 剩余内容
+        else:
+            pond_id_to_info = {p[0]: {
+                "name": p[1], "pond_type": p[2].strip(),
+                "frog_type": p[3], "max_capacity": p[4], "current_count": p[5]
+            } for p in ponds}
 
-        pond_id_to_info = {p[0]: {
-            "name": p[1], "pond_type": p[2].strip(),
-            "frog_type": p[3], "max_capacity": p[4], "current_count": p[5]
-        } for p in ponds}
+            grouped = group_ponds_by_type(pond_id_to_info)
 
-        grouped = group_ponds_by_type(pond_id_to_info)
-
-        # 默认值
-        from_pond_id   = None
-        to_pond_id     = None
-        purchase_price = None
-
-        # ① 外购 ----------------------------------------------------------
-        if operation == "外购":
-            to_pond_id = pond_selector("目标池塘", pond_id_to_info, grouped, "purchase")
-            purchase_price = st.number_input(
-                "外购单价 (元/只)",
-                min_value=0.1, value=20.0, step=1.0, format="%.2f",
-                help="请输入每只蛙的采购价格"
-            )
-
-        # ② 孵化 ----------------------------------------------------------
-        elif operation == "孵化":
-            hatch_grouped = {k: v for k, v in grouped.items() if k == "孵化池"}
-            if not hatch_grouped:
-                st.error("❌ 请先至少创建一个‘孵化池’")
-                st.stop()
-            to_pond_id = pond_selector("孵化池", pond_id_to_info, hatch_grouped, "hatch")
-            purchase_price = None  # 孵化无成本
-
-        # ③ 转池 ----------------------------------------------------------
-        else:  # operation == "转池"
-            src_grouped = {k: v for k, v in grouped.items() if k in TRANSFER_PATH_RULES}
-            if not src_grouped:
-                st.error("❌ 无可用的转出池类型")
-                st.stop()
-            from_pond_id = pond_selector("源池塘（转出）", pond_id_to_info, src_grouped, "transfer_src")
-
-            live_info = pond_id_to_info[from_pond_id]
-            allowed = TRANSFER_PATH_RULES.get(live_info["pond_type"], [])
-            tgt_grouped = {k: v for k, v in grouped.items() if k in allowed and v}
-            if not tgt_grouped:
-                st.error("❌ 无合法目标池")
-                st.stop()
-            to_pond_id = pond_selector("目标池塘（转入）", pond_id_to_info, tgt_grouped, "transfer_tgt")
+            # 默认值
+            from_pond_id   = None
+            to_pond_id     = None
             purchase_price = None
 
-        # 公共输入
-        quantity = st.number_input("数量", min_value=1, value=100, step=10)
-        description = st.text_input("操作描述", placeholder="如：产卵转出 / 外购幼蛙 / 自孵蝌蚪")
-
-        # 提交按钮
-        if st.button(f"✅ 执行{operation}", type="primary"):
-            try:
-                to_pond = get_pond_by_id(to_pond_id)
-                if to_pond[4] + quantity > to_pond[3]:
-                    st.error(f"❌ 目标池「{to_pond[1]}」容量不足！当前 {to_pond[4]}/{to_pond[3]}，无法容纳 {quantity} 只。")
-                    st.stop()
-
-                if operation == "转池":
-                    from_pond = get_pond_by_id(from_pond_id)
-                    if from_pond[4] < quantity:
-                        st.error(f"❌ 源池「{from_pond[1]}」数量不足！当前只有 {from_pond[4]} 只。")
-                        st.stop()
-
-                movement_type = {'转池':'transfer', '外购':'purchase', '孵化':'hatch'}[operation]
-                add_stock_movement(
-                    movement_type=movement_type,
-                    from_pond_id=from_pond_id,
-                    to_pond_id=to_pond_id,
-                    quantity=quantity,
-                    description=description or f"{operation} {quantity} 只",
-                    unit_price=purchase_price
+            # ① 外购 ----------------------------------------------------------
+            if operation == "外购":
+                to_pond_id = pond_selector("目标池塘", pond_id_to_info, grouped, "purchase")
+                purchase_price = st.number_input(
+                    "外购单价 (元/只)",
+                    min_value=0.1, value=20.0, step=1.0, format="%.2f",
+                    help="请输入每只蛙的采购价格"
                 )
-                st.success(f"✅ {operation}成功！")
-                st.rerun()
 
-            except Exception as e:
-                st.error(f"❌ 操作失败: {e}")
+            # ② 孵化 ----------------------------------------------------------
+            elif operation == "孵化":
+                hatch_grouped = {k: v for k, v in grouped.items() if k == "孵化池"}
+                if not hatch_grouped:
+                    st.error("❌ 请先至少创建一个‘孵化池’")
+                else:
+                    to_pond_id = pond_selector("孵化池", pond_id_to_info, hatch_grouped, "hatch")
+                    purchase_price = None  # 孵化无成本
 
-        # 最近记录
-        st.markdown("---")
-        st.subheader("📋 最近转池 / 外购 / 孵化记录")
-        records = get_recent_movements(15)
-        if not records:
-            st.info("暂无操作记录")
-        else:
-            import pandas as pd
-            df_log = pd.DataFrame(records, columns=["ID", "类型", "源池", "目标池", "数量", "描述", "时间"])
-            st.dataframe(df_log, use_container_width=True, hide_index=True)
-            csv = df_log.to_csv(index=False)
-            st.download_button(
-                label="📥 导出 CSV",
-                data=csv,
-                file_name=f"movement_log_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv"
-            )
-            if st.button("🔄 刷新列表"):
-                st.rerun()
+            # ③ 转池 ----------------------------------------------------------
+            else:  # operation == "转池"
+                src_grouped = {k: v for k, v in grouped.items() if k in TRANSFER_PATH_RULES}
+                if not src_grouped:
+                    st.error("❌ 无可用的转出池类型")
+                else:
+                    from_pond_id = pond_selector("源池塘（转出）", pond_id_to_info, src_grouped, "transfer_src")
+
+                    live_info = pond_id_to_info[from_pond_id]
+                    allowed = TRANSFER_PATH_RULES.get(live_info["pond_type"], [])
+                    tgt_grouped = {k: v for k, v in grouped.items() if k in allowed and v}
+                    if not tgt_grouped:
+                        st.error("❌ 无合法目标池")
+                    else:
+                        to_pond_id = pond_selector("目标池塘（转入）", pond_id_to_info, tgt_grouped, "transfer_tgt")
+                        purchase_price = None
+
+            # 公共输入（只在有目标池时才显示）
+            if to_pond_id is not None:
+                quantity = st.number_input("数量", min_value=1, value=100, step=10)
+                description = st.text_input("操作描述", placeholder="如：产卵转出 / 外购幼蛙 / 自孵蝌蚪")
+
+                if st.button(f"✅ 执行{operation}", type="primary"):
+                    try:
+                        to_pond = get_pond_by_id(to_pond_id)
+                        if to_pond[4] + quantity > to_pond[3]:
+                            st.error(f"❌ 目标池「{to_pond[1]}」容量不足！当前 {to_pond[4]}/{to_pond[3]}，无法容纳 {quantity} 只。")
+                        elif operation == "转池" and from_pond_id is not None:
+                            from_pond = get_pond_by_id(from_pond_id)
+                            if from_pond[4] < quantity:
+                                st.error(f"❌ 源池「{from_pond[1]}」数量不足！当前只有 {from_pond[4]} 只。")
+                            else:
+                                movement_type = 'transfer'
+                                add_stock_movement(
+                                    movement_type=movement_type,
+                                    from_pond_id=from_pond_id,
+                                    to_pond_id=to_pond_id,
+                                    quantity=quantity,
+                                    description=description or f"{operation} {quantity} 只",
+                                    unit_price=purchase_price
+                                )
+                                st.success(f"✅ {operation}成功！")
+                                st.rerun()
+                        else:
+                            movement_type = {'外购':'purchase', '孵化':'hatch'}[operation]
+                            add_stock_movement(
+                                movement_type=movement_type,
+                                from_pond_id=None,
+                                to_pond_id=to_pond_id,
+                                quantity=quantity,
+                                description=description or f"{operation} {quantity} 只",
+                                unit_price=purchase_price
+                            )
+                            st.success(f"✅ {operation}成功！")
+                            st.rerun()
+
+                    except Exception as e:
+                        st.error(f"❌ 操作失败: {e}")
+
+                # 最近记录
+                st.markdown("---")
+                st.subheader("📋 最近转池 / 外购 / 孵化记录")
+                records = get_recent_movements(15)
+                if not records:
+                    st.info("暂无操作记录")
+                else:
+                    import pandas as pd
+                    df_log = pd.DataFrame(records, columns=["ID", "类型", "源池", "目标池", "数量", "描述", "时间"])
+                    st.dataframe(df_log, use_container_width=True, hide_index=True)
+                    csv = df_log.to_csv(index=False)
+                    st.download_button(
+                        label="📥 导出 CSV",
+                        data=csv,
+                        file_name=f"movement_log_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv"
+                    )
+                    if st.button("🔄 刷新列表"):
+                        st.rerun()
                         # ----------------------------- Tab 5: 饲料类型 ---------------------------
     with tab5:
         st.subheader("🪱 饲料类型管理")
