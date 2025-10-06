@@ -6,6 +6,13 @@ import psycopg2
 from datetime import datetime, time
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 from dotenv import load_dotenv
+# ================== ① AI 问答新增依赖 ==================
+import json, tempfile, pandas as pd
+from datetime import datetime
+from openai import OpenAI
+from sqlalchemy import create_engine, text, inspect
+from sqlalchemy.exc import SQLAlchemyError
+# =======================================================
 
 # -----------------------------
 # 加载环境变量
@@ -56,6 +63,49 @@ TRANSFER_PATH_RULES = {
     "商品蛙池": ["三年蛙池", "四年蛙池", "五年蛙池", "六年蛙池", "试验池"],
     # 试验池、销售周转池不允许转出（不在 keys 中）
 }
+# ============== 常用备注短语字典 ==============
+COMMON_REMARKS = {
+    "喂养备注": [
+        "",
+        "正常投喂",
+        "加量投喂",
+        "减量投喂",
+        "蛙群活跃",
+        "蛙群食欲一般",
+        "剩料较多",
+        "今日换水",
+        "水温偏高，减料",
+        "水温偏低，加料",
+        "下雨延迟投喂"
+    ],
+    "每日观察": [
+        "",
+        "蛙群活跃，摄食正常",
+        "发现个别浮头",
+        "水面有泡沫",
+        "池底粪便较多",
+        "蝌蚪集群正常",
+        "卵块增加",
+        "发现有死亡个体",
+        "活动力下降",
+        "皮肤颜色正常",
+        "换水后活跃"
+    ],
+    "操作描述": [
+        "",
+        "日常转池",
+        "密度调整",
+        "大小分级",
+        "外购新苗",
+        "自繁孵化",
+        "病害隔离",
+        "销售备货",
+        "实验观察",
+        "清池消毒",
+        "暴雨后应急转移"
+    ]
+}
+# ==========================================
 # -----------------------------
 # 初始化数据库（幂等）
 # -----------------------------
@@ -273,7 +323,23 @@ def initialize_database():
                 );
             """)
             st.toast("✅ 创建销售记录表", icon="💰")
-
+        # 9. daily_log_shiwa（每日养殖日志）
+        if not table_exists(cur, 'daily_log_shiwa'):
+            cur.execute("""
+                CREATE TABLE daily_log_shiwa (
+                    id SERIAL PRIMARY KEY,
+                    pond_id INT NOT NULL REFERENCES pond_shiwa(id) ON DELETE CASCADE,
+                    log_date DATE NOT NULL,
+                    water_temp DECIMAL(4,1),          -- 水温，如 22.5
+                    ph_value DECIMAL(3,1),            -- pH值，如 7.0
+                    light_condition VARCHAR(50),      -- 光照：散射光/直射光/阴暗 等
+                    observation TEXT,                 -- 观察记录（支持多行）
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                    UNIQUE (pond_id, log_date)        -- 同一池塘同一天只允许一条日志
+                );
+            """)
+            st.toast("✅ 创建每日养殖日志表", icon="📝")
         conn.commit()
     except Exception as e:
         st.error(f"❌ 数据库初始化失败: {e}")
@@ -282,89 +348,6 @@ def initialize_database():
         cur.close()
         conn.close()
 
-def initialize_sample_data():
-    st.write("🔧 initialize_sample_data() 开始执行")
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        # 1. 确保 pond_type_shiwa 有数据
-        cur.execute("SELECT COUNT(*) FROM pond_type_shiwa;")
-        pt_cnt = cur.fetchone()[0]
-        st.write(f"pond_type_shiwa 记录数：{pt_cnt}")
-        if pt_cnt == 0:
-            st.write("❌ pond_type_shiwa 为空，请先跑 initialize_database()")
-            return 0
-
-        # 2. 取映射
-        cur.execute("SELECT id, TRIM(name) FROM pond_type_shiwa;")
-        pond_types = {row[1]: row[0] for row in cur.fetchall()}
-        st.write("pond_types 映射：", pond_types)
-
-        cur.execute("SELECT id, name FROM frog_type_shiwa;")
-        frog_types = {row[1]: row[0] for row in cur.fetchall()}
-        st.write("frog_types 映射：", frog_types)
-
-        # 3. 组装 sample_ponds
-        # —— 1. 组装 22 个标准池塘 ——
-        sample_ponds = []
-        for frog_name, frog_id in frog_types.items():
-            # 种蛙池 2 个
-            for i in range(1, 3):
-                sample_ponds.append((f"{frog_name}种蛙池-{i:02d}", pond_types['种蛙池'], frog_id, 1000))
-            # 孵化池 3 个
-            for i in range(1, 4):
-                sample_ponds.append((f"{frog_name}孵化池-{i:02d}", pond_types['孵化池'], frog_id, 1000))
-            # 养殖池 2 个
-            for i in range(1, 3):
-                sample_ponds.append((f"{frog_name}养殖池-{i:02d}", pond_types['养殖池'], frog_id, 1000))
-            # 商品蛙池 1 个
-            sample_ponds.append((f"{frog_name}商品蛙池-01", pond_types['商品蛙池'], frog_id, 1000))
-            sample_ponds.append((f"{frog_name}试验池-01", pond_types['试验池'], frog_id, 200))
-            # 三年~六年周转池 各 1 个
-            for year, pond_type_name in {3: "三年蛙池", 4: "四年蛙池", 5: "五年蛙池", 6: "六年蛙池"}.items():
-                sample_ponds.append((f"{frog_name}{pond_type_name}-01", pond_types[pond_type_name], frog_id, 500))
-
-        # —— 2. 插入池塘（幂等）——
-        created = 0
-        for name, pt_id, ft_id, cap in sample_ponds:
-            cur.execute("SELECT 1 FROM pond_shiwa WHERE name = %s;", (name,))
-            if not cur.fetchone():
-                cur.execute("""
-                    INSERT INTO pond_shiwa (name, pond_type_id, frog_type_id, max_capacity, current_count)
-                    VALUES (%s, %s, %s, %s, 0);
-                """, (name, pt_id, ft_id, cap))
-                created += 1
-
-        # —— 3. 给每个种蛙池放 50 只初始种蛙（外购）——
-        cur.execute("""
-            SELECT id
-            FROM pond_shiwa
-            WHERE pond_type_id = %s
-            AND current_count = 0;
-        """, (pond_types['种蛙池'],))
-        brood_ponds = [row[0] for row in cur.fetchall()]
-
-        for bp_id in brood_ponds:
-            cur.execute("""
-                INSERT INTO stock_movement_shiwa (movement_type, from_pond_id, to_pond_id, quantity, description)
-                VALUES ('purchase', NULL, %s, 50, '【初始数据】首批种蛙引进');
-            """, (bp_id,))
-            cur.execute("""
-                UPDATE pond_shiwa
-                SET current_count = 50
-                WHERE id = %s;
-            """, (bp_id,))
-
-        conn.commit()
-        return created
-
-    except Exception as e:
-        st.exception(e)
-        conn.rollback()
-        return 0
-    finally:
-        cur.close()
-        conn.close()
 def get_recent_movements(limit=20):
     conn = get_db_connection()
     cur = conn.cursor()
@@ -752,6 +735,153 @@ def get_pond_roi_details():
     conn.close()
 
     return feedings, purchases, sales
+def add_daily_log(pond_id, log_date, water_temp, ph_value, light_condition, observation):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO daily_log_shiwa 
+            (pond_id, log_date, water_temp, ph_value, light_condition, observation)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (pond_id, log_date)
+            DO UPDATE SET
+                water_temp = EXCLUDED.water_temp,
+                ph_value = EXCLUDED.ph_value,
+                light_condition = EXCLUDED.light_condition,
+                observation = EXCLUDED.observation,
+                updated_at = NOW();
+        """, (pond_id, log_date, water_temp, ph_value, light_condition, observation))
+        conn.commit()
+        st.success("✅ 每日日志已保存！")
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        cur.close()
+        conn.close()
+
+def get_daily_logs(limit=50):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT dl.log_date, p.name, dl.water_temp, dl.ph_value, dl.light_condition, dl.observation
+        FROM daily_log_shiwa dl
+        JOIN pond_shiwa p ON dl.pond_id = p.id
+        ORDER BY dl.log_date DESC, dl.created_at DESC
+        LIMIT %s;
+    """, (limit,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
+# ================== ② AI 问答专用函数 ==================
+def get_ai_client():
+    """统一拿到 DashScope 兼容 OpenAI 客户端"""
+    api_key = os.getenv("DASHSCOPE_API_KEY")
+    if not api_key:
+        raise RuntimeError("请在 .env 里配置 DASHSCOPE_API_KEY")
+    return OpenAI(api_key=api_key,
+                  base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
+
+@st.cache_data(show_spinner=False)
+def get_db_schema_for_ai():
+    """一次性把 schema 抓回来给 AI，只抓表名-列名-类型，不做数据"""
+    engine = create_engine(DATABASE_URL)
+    inspector = inspect(engine)
+    schema = {}
+    for t in inspector.get_table_names():
+        schema[t] = [{"col": c["name"], "type": str(c["type"])}
+                     for c in inspector.get_columns(t)]
+    return schema
+
+
+def execute_safe_select(sql: str) -> pd.DataFrame:
+    """只允许 SELECT，返回 DataFrame"""
+    sql = sql.strip()
+    if not sql.lower().startswith("select"):
+        raise ValueError("仅允许 SELECT 查询")
+    engine = create_engine(DATABASE_URL)
+    with engine.connect() as conn:
+        return pd.read_sql(text(sql), conn)
+
+
+def ai_ask_database(question: str):
+    """两阶段：生成 SQL -> 自然语言回答"""
+    client = get_ai_client()
+    schema = get_db_schema_for_ai()
+
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "execute_sql_query",
+            "description": "生成安全的 SELECT 查询",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sql": {"type": "string"},
+                    "explanation": {"type": "string"}
+                },
+                "required": ["sql", "explanation"]
+            }
+        }
+    }]
+
+    sys_prompt = f"""
+你是石蛙养殖场数据分析师，数据库 schema 如下（仅使用存在的表和字段）：
+{json.dumps(schema, ensure_ascii=False, indent=2)}
+
+必须调用 execute_sql_query 函数，规则：
+- 只生成 SELECT
+- 表名/字段严格与上面一致
+- 用中文写 explanation
+"""
+
+    response = client.chat.completions.create(
+        model="qwen-plus",
+        messages=[{"role": "system", "content": sys_prompt},
+                  {"role": "user", "content": question}],
+        tools=tools,
+        tool_choice={"type": "function", "function": {"name": "execute_sql_query"}},
+        temperature=0.1
+    )
+
+    args = json.loads(response.choices[0].message.tool_calls[0].function.arguments)
+    sql = args["sql"]
+    df = execute_safe_select(sql)
+
+    # 第二阶段：用数据回答用户
+    second = client.chat.completions.create(
+        model="qwen-plus",
+        messages=[
+            {"role": "system", "content": "你是石蛙养殖场场长，用简洁中文直接回答用户问题，不要提 SQL 或技术词汇。"},
+            {"role": "user", "content": f"用户问题：{question}\n查询结果：\n{df.head(15).to_string(index=False)}"}
+        ],
+        temperature=0.3
+    )
+    return second.choices[0].message.content.strip(), sql, df
+# =======================================================
+# ----------------------------- ① 池子分组 -----------------------------
+def group_ponds_by_type(pond_dict):
+        from collections import defaultdict
+        grouped = defaultdict(list)
+        for pid, info in pond_dict.items():
+            grouped[info["pond_type"]].append(
+                (pid, f"{info['name']}  （当前 {info['current_count']} / {info['max_capacity']}）")
+            )
+        return grouped
+
+
+    # ----------------------------- ② 两级选择组件 -----------------------------
+def pond_selector(label, candidate_dict, grouped, key):
+        """两步选池：先类型 → 再具体池子"""
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            type_pick = st.selectbox(f"{label} · 类型", options=list(grouped.keys()), key=f"{key}_type")
+        with col2:
+            pid_pick = st.selectbox(f"{label} · 池子", options=[p[0] for p in grouped[type_pick]],
+                                    format_func=lambda x: next(p[1] for p in grouped[type_pick] if p[0] == x),
+                                    key=f"{key}_pond")
+        return pid_pick
 # -----------------------------
 # 主应用入口
 # -----------------------------
@@ -774,6 +904,40 @@ def run():
 
         # Tab 1: 池塘总览（表格 + 图表）
     with tab1:
+                                # ================== ③ 新增：AI 问答子模块 ==================
+        st.markdown("---")
+        st.subheader("🤖 AI 养殖场问答")
+        st.caption("例：「现在全场共有多少只蛙？”、“哪类池塘占用率最高？」")
+        if "ai_chat_history" not in st.session_state:
+            st.session_state.ai_chat_history = []
+
+        # 显示历史
+        for q, a in st.session_state.ai_chat_history:
+            with st.chat_message("user"):
+                st.write(q)
+            with st.chat_message("assistant"):
+                st.write(a)
+
+        # 用户输入
+        if q := st.chat_input("输入你的问题，按回车"):
+            with st.chat_message("user"):
+                st.write(q)
+            with st.chat_message("assistant"):
+                with st.spinner("AI 正在查询数据库..."):
+                    try:
+                        answer, sql, df = ai_ask_database(q)
+                        st.write(answer)
+                        with st.expander("🔍 技术详情（点击展开）"):
+                            st.code(sql, language="sql")
+                            st.dataframe(df.head(20), use_container_width=True)
+                        st.session_state.ai_chat_history.append((q, answer))
+                    except Exception as e:
+                        st.error(f"查询失败：{e}")
+
+        if st.button("🗑️ 清空对话"):
+            st.session_state.ai_chat_history.clear()
+            st.rerun()
+        # =======================================================
         st.subheader("📊 所有池塘状态")
         ponds = get_all_ponds()
         
@@ -825,6 +989,7 @@ def run():
                 chart_data = filtered_df.set_index("名称")["占用率 (%)"]
                 st.bar_chart(chart_data, height=400)
 
+
     # Tab 2: 喂养记录（录入 + 总览）
     with tab2:
         st.subheader("🍽️ 喂养日志")
@@ -840,11 +1005,13 @@ def run():
             with st.form("feeding_form"):
                 c1, c2 = st.columns(2)
                 with c1:
-                    pond_id = st.selectbox(
-                        "选择池塘",
-                        options=[p[0] for p in ponds],
-                        format_func=lambda x: next(p[1] for p in ponds if p[0] == x)
-                    )
+                    pond_dict = {p[0]: {
+                        "name": p[1], "pond_type": p[2],
+                        "current_count": p[5], "max_capacity": p[4]
+                    } for p in ponds}
+                    grouped = group_ponds_by_type(pond_dict)
+                    pond_id = pond_selector("投喂池塘", pond_dict, grouped, key="feed")
+
                 with c2:
                     feed_id = st.selectbox(
                         "饲料类型",
@@ -860,7 +1027,9 @@ def run():
                 with col_t:
                     ampm = st.selectbox("时段", ["上午", "下午"])
 
-                notes = st.text_area("备注（可选）")
+                                # ---- 快捷备注 ----
+                quick_feed_note = st.selectbox("快捷备注", COMMON_REMARKS["喂养备注"], key="quick_feed")
+                notes = st.text_area("备注（可选）", value=quick_feed_note)
                 submitted = st.form_submit_button("✅ 提交喂养记录")
 
                 if submitted:
@@ -901,6 +1070,58 @@ def run():
                     st.dataframe(df, use_container_width=True, hide_index=True)
                 else:
                     st.info("暂无喂养记录")
+        st.markdown("---")
+        st.subheader("📝 每日养殖日志（水温 / pH / 观察等）")
+
+        with st.form("daily_log_form"):
+            c1, c2 = st.columns(2)
+            with c1:
+                pond_dict_dl = {p[0]: {
+                    "name": p[1], "pond_type": p[2],
+                    "current_count": p[5], "max_capacity": p[4]
+                } for p in ponds}
+                grouped_dl = group_ponds_by_type(pond_dict_dl)
+                dl_pond_id = pond_selector("日志池塘", pond_dict_dl, grouped_dl, key="daily")
+            with c2:
+                dl_date = st.date_input("日志日期", value=datetime.today(), key="dl_date")
+
+            col_temp, col_ph, col_light = st.columns(3)
+            with col_temp:
+                water_temp = st.number_input("水温 (℃)", min_value=0.0, max_value=40.0, step=0.5, value=22.0)
+            with col_ph:
+                ph_value = st.number_input("pH 值", min_value=0.0, max_value=14.0, step=0.1, value=7.0)
+            with col_light:
+                light_condition = st.selectbox(
+                    "光照条件",
+                    options=["散射光", "直射光", "阴暗", "人工补光", "其他"],
+                    index=0
+                )
+                if light_condition == "其他":
+                    light_condition = st.text_input("自定义光照", "请填写")
+
+                            # ---- 快捷观察 ----
+            quick_observe = st.selectbox("快捷观察", COMMON_REMARKS["每日观察"], key="quick_observe")
+            observation = st.text_area("观察记录（可记录卵块、行为、异常等）", value=quick_observe, height=120)
+
+            dl_submitted = st.form_submit_button("✅ 保存每日日志")
+            if dl_submitted:
+                add_daily_log(
+                    pond_id=dl_pond_id,
+                    log_date=dl_date,
+                    water_temp=water_temp,
+                    ph_value=ph_value,
+                    light_condition=light_condition,
+                    observation=observation.strip()
+                )
+                st.rerun()
+        st.markdown("### 📖 历史每日日志")
+        dl_records = get_daily_logs(30)
+        if dl_records:
+            import pandas as pd
+            df_dl = pd.DataFrame(dl_records, columns=["日期", "池塘", "水温(℃)", "pH", "光照", "观察记录"])
+            st.dataframe(df_dl, use_container_width=True, hide_index=True)
+        else:
+            st.info("暂无每日日志记录")
 
     with tab3:
         st.subheader("创建新池塘")
@@ -949,16 +1170,22 @@ def run():
                         else:
                             st.error(f"❌ 创建失败: {e}")
 
+        # ================= 新增：实时展示已创建池子 =================
         st.markdown("---")
-        st.subheader("🧪 开发辅助：一键初始化示例数据")
-        st.caption("自动创建细皮/粗皮的标准池塘，并给种蛙池添加50只初始种蛙")
-        if st.button("🚀 一键初始化示例数据", type="primary"):
-            try:
-                created = initialize_sample_data()
-                st.success(f"✅ 成功创建 {created} 个新池塘，并初始化种蛙库存！")
-                st.rerun()
-            except Exception as e:
-                st.error(f"❌ 初始化失败: {e}")
+        st.subheader("📋 已创建的池塘")
+        ponds_now = get_all_ponds()          # 复用已有函数，实时查库
+        if not ponds_now:
+            st.info("暂无池塘，快去创建第一个吧！")
+        else:
+            import pandas as pd
+            df = pd.DataFrame(
+                ponds_now,
+                columns=["ID", "名称", "池类型", "蛙种", "最大容量", "当前数量"]
+            )
+            # 让最新创建的排在最上面
+            df = df.iloc[::-1].reset_index(drop=True)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        # ==========================================================
 
         st.markdown("---")
         st.subheader("⚠️ 危险区域：清空测试数据")
@@ -972,32 +1199,7 @@ def run():
                 except Exception as e:
                     st.error(f"❌ 清空失败: {e}")
 
-    # ----------------------------- Tab 4: 转池与外购 -----------------------------
-    # ----------------------------- ① 池子分组 -----------------------------
-    def group_ponds_by_type(pond_dict):
-        from collections import defaultdict
-        grouped = defaultdict(list)
-        for pid, info in pond_dict.items():
-            grouped[info["pond_type"]].append(
-                (pid, f"{info['name']}  （当前 {info['current_count']} / {info['max_capacity']}）")
-            )
-        return grouped
-
-
-    # ----------------------------- ② 两级选择组件 -----------------------------
-    def pond_selector(label, candidate_dict, grouped, key):
-        """两步选池：先类型 → 再具体池子"""
-        col1, col2 = st.columns([1, 2])
-        with col1:
-            type_pick = st.selectbox(f"{label} · 类型", options=list(grouped.keys()), key=f"{key}_type")
-        with col2:
-            pid_pick = st.selectbox(f"{label} · 池子", options=[p[0] for p in grouped[type_pick]],
-                                    format_func=lambda x: next(p[1] for p in grouped[type_pick] if p[0] == x),
-                                    key=f"{key}_pond")
-        return pid_pick
-
-
-    # ----------------------------- Tab 4: 转池 · 外购 · 孵化 -----------------------------
+   
     # ----------------------------- Tab 4: 转池 · 外购 · 孵化 -----------------------------
     with tab4:
         st.subheader("🔄 转池 / 外购 / 孵化操作")
@@ -1057,8 +1259,10 @@ def run():
 
             # 公共输入（只在有目标池时才显示）
             if to_pond_id is not None:
-                quantity = st.number_input("数量", min_value=1, value=100, step=10)
-                description = st.text_input("操作描述", placeholder="如：产卵转出 / 外购幼蛙 / 自孵蝌蚪")
+                quantity = st.number_input("数量", min_value=1, value=1000, step=50)
+                            # ---- 快捷描述 ----
+                quick_desc = st.selectbox("快捷描述", COMMON_REMARKS["操作描述"], key="quick_desc")
+                description = st.text_input("操作描述", value=quick_desc, placeholder="如：产卵转出 / 外购幼蛙 / 自孵蝌蚪")
 
                 if st.button(f"✅ 执行{operation}", type="primary"):
                     try:
@@ -1443,8 +1647,3 @@ def run():
                     total_purchase = sum(p["total_cost"] for p in details["purchases"])
                     total_sales_amt = sum(s["total_amount"] for s in details["sales"])
                     net = total_sales_amt - total_feed - total_purchase
-
-
-
-            # 导出明细（可选）
-            # 可将 feedings/purchases/sales 合并为一个 DataFrame 导出
