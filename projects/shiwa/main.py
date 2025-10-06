@@ -323,23 +323,100 @@ def initialize_database():
                 );
             """)
             st.toast("✅ 创建销售记录表", icon="💰")
-        # 9. daily_log_shiwa（每日养殖日志）
+                # 9. daily_log_shiwa（每日养殖日志）
         if not table_exists(cur, 'daily_log_shiwa'):
             cur.execute("""
                 CREATE TABLE daily_log_shiwa (
                     id SERIAL PRIMARY KEY,
                     pond_id INT NOT NULL REFERENCES pond_shiwa(id) ON DELETE CASCADE,
                     log_date DATE NOT NULL,
-                    water_temp DECIMAL(4,1),          -- 水温，如 22.5
-                    ph_value DECIMAL(3,1),            -- pH值，如 7.0
-                    light_condition VARCHAR(50),      -- 光照：散射光/直射光/阴暗 等
-                    observation TEXT,                 -- 观察记录（支持多行）
+                    water_temp DECIMAL(4,1),
+                    ph_value DECIMAL(3,1),
+                    light_condition VARCHAR(50),
+                    observation TEXT,
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
                     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-                    UNIQUE (pond_id, log_date)        -- 同一池塘同一天只允许一条日志
+                    UNIQUE (pond_id, log_date)
                 );
             """)
             st.toast("✅ 创建每日养殖日志表", icon="📝")
+
+        # 10. 池塘生命周期起点表（独立幂等）
+        if not table_exists(cur, 'pond_life_cycle_shiwa'):
+            cur.execute("""
+                CREATE TABLE pond_life_cycle_shiwa (
+                    id              SERIAL PRIMARY KEY,
+                    movement_id     INT NOT NULL REFERENCES stock_movement_shiwa(id) ON DELETE CASCADE,
+                    pond_id         INT NOT NULL REFERENCES pond_shiwa(id) ON DELETE CASCADE,
+                    frog_type_id    INT NOT NULL REFERENCES frog_type_shiwa(id),
+                    quantity        INT NOT NULL,
+                    start_at        DATE NOT NULL,
+                    stage           VARCHAR(20) CHECK (stage IN ('卵','蝌蚪','变态','幼蛙','成蛙')),
+                    created_at      TIMESTAMP DEFAULT NOW()
+                );
+            """)
+            st.toast("✅ 创建池塘生命周期表", icon="🧬")
+
+       # 11. 阶段提醒视图（每次都重建，方便升级阈值）
+        cur.execute("DROP VIEW IF EXISTS pond_reminder_v;")
+        cur.execute("""
+            CREATE VIEW pond_reminder_v AS
+            WITH base AS (
+                SELECT l.id,
+                    p.name            AS pond_name,
+                    ft.name           AS frog_type,
+                    l.quantity,
+                    l.start_at,
+                    CURRENT_DATE - l.start_at AS days_elapsed,   -- ← 实时计算
+                    l.stage,
+                    CASE l.stage
+                        WHEN '卵'     THEN 70
+                        WHEN '蝌蚪'   THEN 10
+                        WHEN '变态'   THEN 120
+                        WHEN '幼蛙'   THEN 120
+                        ELSE 9999
+                    END AS next_threshold,
+                    CASE l.stage
+                        WHEN '卵'     THEN '蝌蚪期'
+                        WHEN '蝌蚪'   THEN '变态期（高风险）'
+                        WHEN '变态'   THEN '幼蛙期'
+                        WHEN '幼蛙'   THEN '成蛙期'
+                        ELSE NULL
+                    END AS next_stage
+                FROM pond_life_cycle_shiwa l
+                JOIN pond_shiwa p ON p.id = l.pond_id
+                JOIN frog_type_shiwa ft ON ft.id = l.frog_type_id
+                WHERE l.stage <> '成蛙'
+            )
+            SELECT *,
+                next_threshold - days_elapsed AS days_left
+            FROM base
+            WHERE days_elapsed BETWEEN next_threshold - 3
+                            AND next_threshold + 5;
+        """)
+        st.toast("✅ 创建/刷新阶段提醒视图", icon="⏰")
+        # 12. 喂养提醒视图：≥5天未喂的池塘
+        cur.execute("DROP VIEW IF EXISTS feeding_reminder_v;")
+        cur.execute("""
+            CREATE VIEW feeding_reminder_v AS
+            WITH last_feed AS (
+                SELECT
+                    p.id   AS pond_id,
+                    p.name AS pond_name,
+                    ft.name AS frog_type,
+                    MAX(fr.fed_at)::date AS last_fed_date,
+                    CURRENT_DATE - MAX(fr.fed_at)::date AS days_since_last
+                FROM pond_shiwa p
+                JOIN frog_type_shiwa ft ON ft.id = p.frog_type_id
+                LEFT JOIN feeding_record_shiwa fr ON fr.pond_id = p.id
+                GROUP BY p.id, p.name, ft.name
+            )
+            SELECT *
+            FROM last_feed
+            WHERE days_since_last >= 5      -- 5天及以上未喂
+            OR days_since_last IS NULL;  -- 从未投喂过
+        """)
+        st.toast("✅ 创建/刷新喂养提醒视图", icon="🪱")
         conn.commit()
     except Exception as e:
         st.error(f"❌ 数据库初始化失败: {e}")
@@ -356,6 +433,7 @@ def get_recent_movements(limit=20):
                CASE sm.movement_type
                    WHEN 'transfer' THEN '转池'
                    WHEN 'purchase' THEN '外购'
+                   WHEN 'hatch'    THEN '孵化'
                    WHEN 'sale'     THEN '销售出库'
                END AS movement_type,
                fp.name   AS from_name,
@@ -370,7 +448,8 @@ def get_recent_movements(limit=20):
         LIMIT %s;
     """, (limit,))
     rows = cur.fetchall()
-    cur.close(); conn.close()
+    cur.close()
+    conn.close()
     return rows
 # -----------------------------
 # 业务功能函数
@@ -487,36 +566,58 @@ def get_pond_by_id(pond_id):
     cur.close()
     conn.close()
     return row  # (id, name, frog_type_id, max_capacity, current_count)
-
-def add_stock_movement(movement_type, from_pond_id, to_pond_id, quantity, description, unit_price=None):
-    """插入转池或外购记录，并自动更新池子 current_count"""
+def _log_life_start(conn, movement_id, to_pond_id, quantity, movement_type):
+    cur = conn.cursor()
+    cur.execute("SELECT frog_type_id FROM pond_shiwa WHERE id=%s", (to_pond_id,))
+    frog_type_id = cur.fetchone()[0]
+    stage = '卵' if movement_type in ('hatch', 'purchase') else '幼蛙'
+    cur.execute("""
+        INSERT INTO pond_life_cycle_shiwa
+        (movement_id, pond_id, frog_type_id, quantity, start_at, stage)
+        VALUES (%s, %s, %s, %s, CURRENT_DATE, %s)
+    """, (movement_id, to_pond_id, frog_type_id, quantity, stage))
+def add_stock_movement(movement_type, from_pond_id, to_pond_id, quantity,
+                       description, unit_price=None):
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        # 插入 movement 记录（现在支持 unit_price）
+        # ===== 原有逻辑开始 =====
         cur.execute("""
-            INSERT INTO stock_movement_shiwa 
+            INSERT INTO stock_movement_shiwa
             (movement_type, from_pond_id, to_pond_id, quantity, description, unit_price)
-            VALUES (%s, %s, %s, %s, %s, %s);
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING id;
         """, (movement_type, from_pond_id, to_pond_id, quantity, description, unit_price))
+        movement_id = cur.fetchone()[0]
 
-        # 更新目标池 current_count (+)
+        # 更新目标池
         cur.execute("""
-            UPDATE pond_shiwa SET current_count = current_count + %s
-            WHERE id = %s;
+            UPDATE pond_shiwa SET current_count = current_count + %s WHERE id = %s;
         """, (quantity, to_pond_id))
 
-        # 如果是转池，更新源池 current_count (-)
+        # 更新源池
         if from_pond_id is not None:
             cur.execute("""
-                UPDATE pond_shiwa SET current_count = current_count - %s
-                WHERE id = %s;
+                UPDATE pond_shiwa SET current_count = current_count - %s WHERE id = %s;
             """, (quantity, from_pond_id))
 
+        _log_life_start(conn, movement_id, to_pond_id, quantity, movement_type)
+        # ===== 原有逻辑结束 =====
+
         conn.commit()
+        return True, None          # 成功
     except Exception as e:
         conn.rollback()
-        raise e
+        msg = str(e)
+        # -------- 人话映射 --------
+        if '蛙种不同' in msg or '源池与目标池蛙种不同' in msg:
+            return False, "❌ 转池失败：源池与目标池蛙种不一致，无法混养！"
+        if '源池或目标池不存在' in msg:
+            return False, "❌ 转池失败：源池或目标池不存在，请检查池塘是否已创建。"
+        if '容量不足' in msg:
+            return False, "❌ 目标池容量不足，请减少数量或扩大容量。"
+        # 其它未知异常
+        return False, f"❌ 操作失败：{msg}"
     finally:
         cur.close()
         conn.close()
@@ -992,6 +1093,22 @@ def run():
 
     # Tab 2: 喂养记录（录入 + 总览）
     with tab2:
+        # ---- 喂养提醒卡片 ----
+        conn = get_db_connection()
+        feed_remind = pd.read_sql("SELECT * FROM feeding_reminder_v ORDER BY days_since_last DESC", conn)
+        conn.close()
+
+        if feed_remind.empty:
+            st.info("✅ 所有池塘近5天内均已投喂")
+        else:
+            st.warning("⚠️ 以下池塘已超过5天未投喂，请及时补喂！")
+            for _, r in feed_remind.iterrows():
+                day = r.days_since_last or "（从未投喂）"
+                st.markdown(
+                    f"- **{r.pond_name}**（{r.frog_type}） "
+                    f" 距离上次投喂 **{day}** 天 （{r.last_fed_date or '无记录'}）"
+                )
+        st.markdown("---")
         st.subheader("🍽️ 喂养日志")
         ponds = get_all_ponds()
         feed_types = get_feed_types()
@@ -1203,6 +1320,22 @@ def run():
     # ----------------------------- Tab 4: 转池 · 外购 · 孵化 -----------------------------
     with tab4:
         st.subheader("🔄 转池 / 外购 / 孵化操作")
+         # ---- 系统提醒 ----
+        conn = get_db_connection()
+        reminds = pd.read_sql("SELECT * FROM pond_reminder_v", conn)
+        conn.close()
+
+        if reminds.empty:
+            st.info("✅ 当前无阶段提醒，所有批次正常生长")
+        else:
+            st.warning("⚠️ 有以下批次到达关键阶段，请及时处理！")
+            for _, r in reminds.iterrows():
+                st.markdown(
+                    f"- **{r.pond_name}**（{r.frog_type}）"
+                    f" **{r.quantity}只** 已养 **{r.days_elapsed}天**，"
+                    f" 预计 **{r.days_left}天后**进入 **{r.next_stage}**"
+                )
+        st.markdown("---")
         operation = st.radio("操作类型", ["转池", "外购", "孵化"], horizontal=True, key="op_type")
 
         ponds = get_all_ponds()
@@ -1265,41 +1398,32 @@ def run():
                 description = st.text_input("操作描述", value=quick_desc, placeholder="如：产卵转出 / 外购幼蛙 / 自孵蝌蚪")
 
                 if st.button(f"✅ 执行{operation}", type="primary"):
-                    try:
-                        to_pond = get_pond_by_id(to_pond_id)
-                        if to_pond[4] + quantity > to_pond[3]:
-                            st.error(f"❌ 目标池「{to_pond[1]}」容量不足！当前 {to_pond[4]}/{to_pond[3]}，无法容纳 {quantity} 只。")
-                        elif operation == "转池" and from_pond_id is not None:
-                            from_pond = get_pond_by_id(from_pond_id)
-                            if from_pond[4] < quantity:
-                                st.error(f"❌ 源池「{from_pond[1]}」数量不足！当前只有 {from_pond[4]} 只。")
-                            else:
-                                movement_type = 'transfer'
-                                add_stock_movement(
-                                    movement_type=movement_type,
-                                    from_pond_id=from_pond_id,
-                                    to_pond_id=to_pond_id,
-                                    quantity=quantity,
-                                    description=description or f"{operation} {quantity} 只",
-                                    unit_price=purchase_price
-                                )
-                                st.success(f"✅ {operation}成功！")
-                                st.rerun()
-                        else:
-                            movement_type = {'外购':'purchase', '孵化':'hatch'}[operation]
-                            add_stock_movement(
-                                movement_type=movement_type,
-                                from_pond_id=None,
-                                to_pond_id=to_pond_id,
-                                quantity=quantity,
-                                description=description or f"{operation} {quantity} 只",
-                                unit_price=purchase_price
-                            )
-                            st.success(f"✅ {operation}成功！")
-                            st.rerun()
-
-                    except Exception as e:
-                        st.error(f"❌ 操作失败: {e}")
+                    # 1. 容量检查（所有操作通用）
+                    to_pond = get_pond_by_id(to_pond_id)
+                    if to_pond[4] + quantity > to_pond[3]:
+                        st.error(f"❌ 目标池「{to_pond[1]}」容量不足！当前 {to_pond[4]}/{to_pond[3]}，无法容纳 {quantity} 只。")
+                        st.stop()          # 提前结束，下面不执行
+                    # 2. 转池专属数量检查
+                    if operation == "转池" and from_pond_id is not None:
+                        from_pond = get_pond_by_id(from_pond_id)
+                        if from_pond[4] < quantity:
+                            st.error(f"❌ 源池「{from_pond[1]}」数量不足！当前只有 {from_pond[4]} 只。")
+                            st.stop()      # 提前结束
+                    # 3. 执行入库
+                    movement_type = {'转池': 'transfer', '外购': 'purchase', '孵化': 'hatch'}[operation]
+                    success, hint = add_stock_movement(
+                        movement_type=movement_type,
+                        from_pond_id=from_pond_id,
+                        to_pond_id=to_pond_id,
+                        quantity=quantity,
+                        description=description or f"{operation} {quantity} 只",
+                        unit_price=purchase_price
+                    )
+                    if success:
+                        st.success(f"✅ {operation}成功！")
+                        st.rerun()
+                    else:
+                        st.error(hint)   # 人话提示
 
                 # 最近记录
                 st.markdown("---")
