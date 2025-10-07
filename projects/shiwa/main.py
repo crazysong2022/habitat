@@ -1066,7 +1066,7 @@ def get_ai_client():
     if not api_key:
         raise RuntimeError("请在 .env 里配置 DASHSCOPE_API_KEY")
     return OpenAI(api_key=api_key,
-                  base_url="https://dashscope.aliyuncs.com/compatible-mode/v1 ")
+                  base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
 
 @st.cache_data(show_spinner=False)
 def get_db_schema_for_ai():
@@ -1862,6 +1862,7 @@ def run():
 
             col_prev, col_next, col_info = st.columns([1, 1, 3])
             current_page = st.session_state.movement_page
+            current_page = max(0, current_page)
 
             with col_prev:
                 if st.button("⬅️ 上一页", disabled=(current_page == 0), key="movement_prev"):
@@ -1935,6 +1936,7 @@ def run():
 
             col_prev_d, col_next_d, col_info_d = st.columns([1, 1, 3])
             current_page_d = st.session_state.death_page
+            current_page_d = max(0, current_page_d)
 
             with col_prev_d:
                 if st.button("⬅️ 上一页", disabled=(current_page_d == 0), key="death_prev"):
