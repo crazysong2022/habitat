@@ -1,3 +1,4 @@
+# app.py  2025-06-25  兼容 Excel→PG 临时表版本
 import streamlit as st
 import os
 import json
@@ -6,29 +7,21 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine, text, inspect
 from openai import OpenAI
 import tempfile
+import uuid
 
-# -----------------------------
-# 初始化
-# -----------------------------
 load_dotenv()
 
+# -----------------------------  AI 客户端 ----------------------------- #
 def get_ai_client():
     api_key = os.getenv("DASHSCOPE_API_KEY")
-    base_url = os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1 ").strip()
+    base_url = os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1").strip()
     if not api_key:
         st.error("❌ 请在 .env 中设置 DASHSCOPE_API_KEY")
         st.stop()
     return OpenAI(api_key=api_key, base_url=base_url)
 
-# -----------------------------
-# 数据库连接管理
-# -----------------------------
-DB_TYPES = {
-    "PostgreSQL": "postgresql",
-    "MySQL": "mysql",
-    "SQLite": "sqlite",
-    "Oracle": "oracle"
-}
+# -----------------------------  数据库连接 ----------------------------- #
+DB_TYPES = {"PostgreSQL": "postgresql", "MySQL": "mysql", "SQLite": "sqlite", "Oracle": "oracle"}
 
 def build_connection_string(db_type, config):
     if db_type == "postgresql":
@@ -42,80 +35,43 @@ def build_connection_string(db_type, config):
     else:
         raise ValueError("不支持的数据库类型")
 
-def test_database_connection(db_type, config):
-    try:
-        if db_type == "sqlite":
-            if "file_path" not in config:
-                return False, "请上传 SQLite 文件"
-            url = build_connection_string(db_type, config)
-            engine = create_engine(url)
-            with engine.connect() as conn:
-                conn.execute(text("SELECT sqlite_version()"))
-            return True, "✅ SQLite 连接成功"
-        else:
-            url = build_connection_string(db_type, config)
-            engine = create_engine(url)
-            with engine.connect() as conn:
-                if db_type == "postgresql":
-                    conn.execute(text("SELECT version()"))
-                elif db_type == "mysql":
-                    conn.execute(text("SELECT VERSION()"))
-                elif db_type == "oracle":
-                    conn.execute(text("SELECT * FROM v$version WHERE rownum = 1"))
-            return True, "✅ 数据库连接成功"
-    except Exception as e:
-        return False, f"❌ 连接失败: {str(e)}"
-
-def get_db_schema(db_type, config):
-    try:
-        url = build_connection_string(db_type, config)
-        engine = create_engine(url)
-        inspector = inspect(engine)
-        schema = {}
-        for table in inspector.get_table_names():
-            cols = inspector.get_columns(table)
-            schema[table] = [
-                {"column": col["name"], "type": str(col["type"])}
-                for col in cols
-            ]
-        return schema
-    except Exception as e:
-        st.error(f"获取 schema 失败: {e}")
-        return {}
-
-def execute_safe_query(db_type, config, sql):
+# -----------------------------  参数化执行 SQL ----------------------------- #
+def execute_safe_query(db_type, config, sql: str, params: dict):
     if not sql.strip().lower().startswith("select"):
         return None, "❌ 仅允许 SELECT 查询"
     dangerous = ["drop", "delete", "update", "insert", "alter", "create", "truncate"]
     if any(kw in sql.lower() for kw in dangerous):
-        return None, "❌ 检测到危险操作"
-
+        return None, "❌ 检测到危险关键字（仅允许 SELECT 查询）"
     try:
-        url = build_connection_string(db_type, config)
-        engine = create_engine(url)
+        # Excel 转表模式：config 里只有 table 字段
+        if config.get("table") and "host" not in config:
+            engine = create_engine(os.getenv("DATABASE_URL"), pool_pre_ping=True)
+        else:
+            url = build_connection_string(db_type, config)
+            engine = create_engine(url, pool_pre_ping=True)
         with engine.connect() as conn:
-            df = pd.read_sql(text(sql), conn)
+            stmt = text(sql).bindparams(**params)
+            df = pd.read_sql(stmt, conn)
         return df, None
     except Exception as e:
         return None, f"SQL 执行错误: {str(e)}"
 
-# -----------------------------
-# AI 助手：两阶段
-# -----------------------------
+# -----------------------------  AI：生成参数化 SQL ----------------------------- #
 def ask_ai_generate_sql(user_question: str, schema_info: dict):
     client = get_ai_client()
     tools = [{
         "type": "function",
         "function": {
             "name": "execute_sql_query",
-            "description": "生成安全的 SELECT 查询",
+            "description": "生成安全的 SELECT 查询（含占位符）",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "sql": {"type": "string"},
+                    "params": {"type": "object"},
                     "explanation": {"type": "string"}
                 },
-                "required": ["sql", "explanation"]
+                "required": ["sql", "params", "explanation"]
             }
         }
     }]
@@ -127,15 +83,20 @@ def ask_ai_generate_sql(user_question: str, schema_info: dict):
 完整结构：
 {json.dumps(schema_info, indent=2, ensure_ascii=False)}
 
-你必须调用 execute_sql_query 函数。
-规则：
-- 只生成 SELECT
-- 表名和字段必须存在
-- 用中文写 explanation
+【重要】
+1. 只允许生成带占位符的 SELECT 语句，示例：
+   SELECT col1, col2
+   FROM table_name
+   WHERE col3 = :param_1
+     AND col4 > :param_2
+   LIMIT 100
+2. 把占位符对应的值也一起返回，格式：
+   {{"sql": "...", "params": {{"param_1": "真实值1", "param_2": 真实值2}}, "explanation": "..."}}
+3. 禁止把任何用户输入直接拼进 SQL 字符串。
+4. explanation 用中文。
 """
-
     response = client.chat.completions.create(
-        model="qwen-plus",
+        model=os.getenv("AI_MODEL", "qwen-plus"),
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_question}
@@ -144,53 +105,72 @@ def ask_ai_generate_sql(user_question: str, schema_info: dict):
         tool_choice={"type": "function", "function": {"name": "execute_sql_query"}},
         temperature=0.1
     )
-
     tool_calls = response.choices[0].message.tool_calls
     if not tool_calls:
         return {"error": "模型未调用函数"}
-
     try:
         args = json.loads(tool_calls[0].function.arguments)
-        sql = args.get("sql", "").strip()
-        explanation = args.get("explanation", "").strip()
-        if not sql:
-            return {"error": "SQL 为空"}
-        return {"sql": sql, "explanation": explanation}
+        return {"sql": args["sql"], "params": args.get("params", {}), "explanation": args["explanation"]}
     except Exception as e:
         return {"error": f"解析失败: {e}"}
 
+# -----------------------------  自然语言回答 ----------------------------- #
 def generate_natural_answer(user_question: str, sql: str, result_df: pd.DataFrame):
     client = get_ai_client()
-    
-    if result_df.empty:
-        result_text = "查询返回空结果。"
-    else:
-        sample = result_df.head(10)
-        result_text = sample.to_string(index=False)
-
+    result_text = "查询返回空结果。" if result_df.empty else result_df.head(10).to_string(index=False)
     messages = [
-        {
-            "role": "system",
-            "content": "你是一个专业的数据分析师。请根据用户的原始问题、执行的 SQL 和查询结果，用简洁、友好的自然语言直接回答用户。不要提 SQL，不要用技术术语，使用中文。"
-        },
-        {
-            "role": "user",
-            "content": f"原始问题：{user_question}\n\n执行的 SQL：{sql}\n\n查询结果：\n{result_text}"
-        }
+        {"role": "system", "content": "你是一个专业的数据分析师。请根据用户的原始问题、执行的 SQL 和查询结果，用简洁、友好的自然语言直接回答用户。不要提 SQL，不要用技术术语，使用中文。"},
+        {"role": "user", "content": f"原始问题：{user_question}\n\n执行的 SQL：{sql}\n\n查询结果：\n{result_text}"}
     ]
-
     response = client.chat.completions.create(
-        model="qwen-plus",
+        model=os.getenv("AI_MODEL", "qwen-plus"),
         messages=messages,
         temperature=0.3
     )
     return response.choices[0].message.content.strip()
-# -----------------------------
-# 文件数据源支持（Excel/CSV）
-# -----------------------------
+
+# -----------------------------  数据库 schema ----------------------------- #
+def get_db_schema(db_type, config):
+    from sqlalchemy import inspect
+    try:
+        if config.get("table") and "host" not in config:
+            # Excel 模式：只查指定的临时表
+            engine = create_engine(os.getenv("DATABASE_URL"), pool_pre_ping=True)
+            inspector = inspect(engine)
+            table_name = config["table"]
+            if table_name not in inspector.get_table_names():
+                return {}
+            cols = inspector.get_columns(table_name)
+            return {table_name: [{"column": col["name"], "type": str(col["type"])} for col in cols]}
+        else:
+            # 原有逻辑：查所有表
+            engine = create_engine(build_connection_string(db_type, config), pool_pre_ping=True)
+            inspector = inspect(engine)
+            schema = {}
+            for table in inspector.get_table_names():
+                cols = inspector.get_columns(table)
+                schema[table] = [{"column": col["name"], "type": str(col["type"])} for col in cols]
+            return schema
+    except Exception as e:
+        st.error(f"获取 schema 失败: {e}")
+        return {}
+
+# -----------------------------  文件数据源 → PG 临时表 ----------------------------- #
+def excel_to_postgresql(df: pd.DataFrame, table_name: str) -> str:
+    """
+    把 DataFrame 写入 habitat 库临时表，返回表名（temp_sessionid_xxx）
+    """
+    from sqlalchemy import create_engine, text
+    url = os.getenv("DATABASE_URL")
+    engine = create_engine(url, pool_pre_ping=True)
+    temp_table = f"temp_{st.session_state.session_id}_{table_name}"
+    with engine.begin() as conn:
+        conn.execute(text(f'DROP TABLE IF EXISTS "{temp_table}"'))
+        df.to_sql(temp_table, conn, index=False, method='multi', chunksize=5000)
+    st.success(f"✅ 已把 Excel 写入 habitat 库临时表：{temp_table}")
+    return temp_table
 
 def load_dataframe_from_file(uploaded_file):
-    """安全加载用户上传的 Excel/CSV 文件为 DataFrame"""
     try:
         if uploaded_file.name.endswith('.csv'):
             df = pd.read_csv(uploaded_file)
@@ -202,62 +182,101 @@ def load_dataframe_from_file(uploaded_file):
     except Exception as e:
         return None, f"❌ 文件解析失败: {str(e)}"
 
-def get_file_schema(df: pd.DataFrame):
-    """从 DataFrame 提取 schema 供 AI 使用"""
-    schema = {}
-    # 假设整个文件是一个“表”，命名为 'uploaded_data'
-    schema["uploaded_data"] = [
-        {"column": col, "type": str(df[col].dtype)}
-        for col in df.columns
-    ]
-    return schema
-def ask_ai_answer_from_file(user_question: str, schema_info: dict, sample_data: str):
-    """让 AI 直接基于 schema 和数据样本回答问题，不生成 SQL"""
-    client = get_ai_client()
+# -----------------------------  聊天处理函数 ----------------------------- #
+def db_chat_handler(prompt: str):
+    schema = get_db_schema(st.session_state.db_type, st.session_state.db_config)
+    if not schema:
+        st.warning("无法加载数据结构")
+        return
+    with st.chat_message("assistant"):
+        error_msg = None
+        with st.spinner("🧠 AI 正在分析数据..."):
+            ai_res = ask_ai_generate_sql(prompt, schema)
+            if "error" in ai_res:
+                error_msg = ai_res["error"]
+            else:
+                df, err = execute_safe_query(
+                    st.session_state.db_type,
+                    st.session_state.db_config,
+                    ai_res["sql"],
+                    ai_res["params"]
+                )
+                if err:
+                    error_msg = err
+                else:
+                    answer = generate_natural_answer(prompt, ai_res["sql"], df)
+        if error_msg:
+            st.error(error_msg)
+            st.session_state.ai_chat.append({"user": prompt, "answer": error_msg, "sql": None, "df": None})
+        else:
+            st.markdown(answer)
+            with st.expander("🔍 技术详情"):
+                st.code(ai_res["sql"], language="sql")
+                st.dataframe(df, use_container_width=True)
+            st.session_state.ai_chat.append({
+                "user": prompt, "answer": answer,
+                "sql": ai_res["sql"], "df": df
+            })
+
+def file_chat_handler(prompt: str):
+    df = st.session_state.file_df
+    temp_table = excel_to_postgresql(df, "excel_data")
+
+    # 切换到数据库模式
+    st.session_state.db_type = "postgresql"
+    st.session_state.db_config = {"table": temp_table}
+    st.session_state.data_mode = "database"
+
+    # 补上缺失的初始化
+    if "ai_chat" not in st.session_state:
+        st.session_state.ai_chat = []
+
+    # 继续走数据库问答流
+    db_chat_handler(prompt)
+def cleanup_temp_table(table_name: str):
+    """安全删除临时表，带错误提示"""
+    if not table_name or not table_name.startswith("temp_"):
+        return  # 安全防护
     
-    system_prompt = f"""
-你是一个专业的数据分析师。用户上传了一个数据文件，结构如下：
-
-表名：uploaded_data
-{json.dumps(schema_info, indent=2, ensure_ascii=False)}
-
-以下是前 5 行数据样本（用制表符分隔）：
-{sample_data}
-
-请根据用户的原始问题，直接用中文给出简洁、准确的自然语言回答。
-- 不要提“SQL”、“查询”、“表”等技术术语
-- 如果数据不足以回答，请说“数据中未找到相关信息”或“需要更多信息”
-- 回答要友好、专业、面向业务决策
-"""
-
-    response = client.chat.completions.create(
-        model="qwen-plus",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_question}
-        ],
-        temperature=0.3
-    )
-    return response.choices[0].message.content.strip()
-# -----------------------------
-# 主应用
-# -----------------------------
+    try:
+        engine = create_engine(os.getenv("DATABASE_URL"), pool_pre_ping=True)
+        with engine.begin() as conn:  # ✅ 确保事务提交
+            result = conn.execute(text(f'DROP TABLE IF EXISTS "{table_name}"'))
+        # 可选：记录日志
+        # st.toast(f"✅ 已删除临时表: {table_name}", icon="🗑️")
+    except Exception as e:
+        st.error(f"❌ 删除临时表 '{table_name}' 失败: {str(e)}")
+        raise  # 在调试阶段建议 raise，上线后可注释
+def list_temp_tables():
+    """列出 habitat 库中所有以 temp_ 开头的表"""
+    try:
+        engine = create_engine(os.getenv("DATABASE_URL"), pool_pre_ping=True)
+        inspector = inspect(engine)
+        all_tables = inspector.get_table_names()
+        temp_tables = [t for t in all_tables if t.startswith("temp_")]
+        return sorted(temp_tables)
+    except Exception as e:
+        st.error(f"获取临时表列表失败: {e}")
+        return []
+# -----------------------------  主页面 ----------------------------- #
 def run():
-    st.title("🤖 AI 领导决策助手")
+    st.set_page_config(page_title="AI 领导决策助手", layout="wide")
+    if "session_id" not in st.session_state:
+        st.session_state.session_id = uuid.uuid4().hex[:8]
+        if "excel_table" not in st.session_state:
+            st.session_state.excel_table = None  # 当前正在用的临时表名
+        if "excel_df" not in st.session_state:
+            st.session_state.excel_df = None     # 缓存的 DataFrame，可选
+
+    st.title("🤖 AI 领导决策助手（参数化版）")
     st.caption("支持 PostgreSQL / MySQL / SQLite / Oracle / Excel / CSV")
 
-    # 选择数据源类型：数据库 or 文件
-    data_source = st.radio(
-        "选择数据源类型",
-        ("数据库", "Excel/CSV 文件"),
-        horizontal=True
-    )
+    data_source = st.radio("选择数据源类型", ("数据库", "Excel/CSV 文件"), horizontal=True)
 
+    # ========== 数据库模式（原封不动） ========== #
     if data_source == "数据库":
-        # ========== 原有数据库逻辑（完全保留） ==========
         db_type_name = st.selectbox("1️⃣ 选择数据库类型", list(DB_TYPES.keys()))
         db_type = DB_TYPES[db_type_name]
-
         config = {}
         if db_type == "sqlite":
             uploaded_file = st.file_uploader("2️⃣ 上传 SQLite 文件 (.db, .sqlite)", type=["db", "sqlite"])
@@ -269,166 +288,131 @@ def run():
             config["host"] = st.text_input("主机 (Host)", value="localhost")
             default_port = {"postgresql": 5432, "mysql": 3306, "oracle": 1521}
             config["port"] = st.number_input("端口 (Port)", value=default_port[db_type], min_value=1, max_value=65535)
-            if db_type != "oracle":
-                config["database"] = st.text_input("数据库名 (Database)")
-            else:
-                config["service_name"] = st.text_input("服务名 (Service Name)")
+            config["database"] = st.text_input("数据库名 (Database)") if db_type != "oracle" else None
+            config["service_name"] = st.text_input("服务名 (Service Name)") if db_type == "oracle" else None
             config["user"] = st.text_input("用户名 (User)")
             config["password"] = st.text_input("密码 (Password)", type="password")
 
         if st.button("🧪 测试连接"):
             if db_type == "sqlite" and "file_path" not in config:
                 st.error("请先上传 SQLite 文件")
-            elif db_type != "sqlite" and not all(
-                config.get(k) for k in ["host", "port", "user", "password"] 
-                if k in config
-            ):
+            elif db_type != "sqlite" and not all(config.get(k) for k in ["host", "port", "user", "password"] if k in config):
                 st.error("请填写所有必要字段")
             else:
-                success, msg = test_database_connection(db_type, config)
-                if success:
-                    st.success(msg)
+                from sqlalchemy import inspect
+                try:
+                    engine = create_engine(build_connection_string(db_type, config))
+                    with engine.connect() as conn:
+                        conn.execute(text("SELECT 1"))
+                    st.success("✅ 数据库连接成功")
                     st.session_state.db_config = config
                     st.session_state.db_type = db_type
                     st.session_state.data_mode = "database"
-                else:
-                    st.error(msg)
+                except Exception as e:
+                    st.error(f"❌ 连接失败: {e}")
 
-        # AI 助手（数据库模式）
         if "db_config" in st.session_state and st.session_state.get("data_mode") == "database":
             st.markdown("---")
             st.subheader("💬 问任何关于你数据的问题")
-
             schema = get_db_schema(st.session_state.db_type, st.session_state.db_config)
             if not schema:
                 st.warning("无法加载数据结构")
                 return
-
             if "ai_chat" not in st.session_state:
                 st.session_state.ai_chat = []
-
-            # 显示历史
             for msg in st.session_state.ai_chat:
                 with st.chat_message("user"):
                     st.markdown(msg["user"])
                 with st.chat_message("assistant"):
                     st.markdown(msg["answer"])
-                    if "sql" in msg:
+                    if "sql" in msg and msg["sql"] is not None:
                         with st.expander("🔍 技术详情"):
                             st.code(msg["sql"], language="sql")
                             st.dataframe(msg["df"], use_container_width=True)
-
-            # 用户输入
-            if prompt := st.chat_input("例如：最近利润最高的销售是哪笔？"):
+            if prompt := st.chat_input("例如：最近利润最高的销售是哪笔？", key="db_chat_input"):
                 with st.chat_message("user"):
                     st.markdown(prompt)
-
-                with st.chat_message("assistant"):
-                    with st.spinner("🧠 AI 正在分析数据..."):
-                        ai_sql_result = ask_ai_generate_sql(prompt, schema)
-                        if "error" in ai_sql_result:
-                            st.error(ai_sql_result["error"])
-                            st.session_state.ai_chat.append({
-                                "user": prompt,
-                                "answer": ai_sql_result["error"],
-                                "sql": None,
-                                "df": None
-                            })
-                            st.stop()
-
-                        sql = ai_sql_result["sql"]
-                        df, exec_error = execute_safe_query(st.session_state.db_type, st.session_state.db_config, sql)
-                        if exec_error:
-                            st.error(exec_error)
-                            st.session_state.ai_chat.append({
-                                "user": prompt,
-                                "answer": exec_error,
-                                "sql": sql,
-                                "df": None
-                            })
-                            st.stop()
-
-                        natural_answer = generate_natural_answer(prompt, sql, df)
-
-                    st.markdown(natural_answer)
-
-                    with st.expander("🔍 技术详情"):
-                        st.code(sql, language="sql")
-                        st.dataframe(df, use_container_width=True)
-
-                    st.session_state.ai_chat.append({
-                        "user": prompt,
-                        "answer": natural_answer,
-                        "sql": sql,
-                        "df": df
-                    })
-
+                st.session_state.ai_chat.append({"user": prompt, "answer": "", "sql": None, "df": None})
+                db_chat_handler(prompt)
             if st.button("🗑️ 清除对话"):
                 st.session_state.ai_chat = []
                 st.rerun()
 
+        # ========== Excel/CSV 文件模式 ========== #
     else:
-        # ========== 新增：Excel/CSV 文件模式 ==========
+                                # ========== 临时表管理（新增） ========== #
+        with st.expander("🗑️ 临时表管理（手动清理）", expanded=False):
+            temp_tables = list_temp_tables()
+            if not temp_tables:
+                st.info("暂无临时表")
+            else:
+                selected_tables = st.multiselect(
+                    "选择要删除的临时表",
+                    options=temp_tables,
+                    default=[]
+                )
+                if st.button("💥 批量删除选中的临时表", type="secondary"):
+                    if selected_tables:
+                        for table in selected_tables:
+                            cleanup_temp_table(table)
+                        st.success(f"✅ 已删除 {len(selected_tables)} 张临时表")
+                        st.rerun()
+                    else:
+                        st.warning("请至少选择一张表")
         st.subheader("📁 上传你的 Excel 或 CSV 文件")
         uploaded_file = st.file_uploader(
-            "上传数据文件",
-            type=["csv", "xlsx", "xls"],
-            help="支持 .csv, .xlsx, .xls 格式"
+            "上传数据文件", type=["csv", "xlsx", "xls"], key="uploader"
         )
-
         if uploaded_file:
             df, error = load_dataframe_from_file(uploaded_file)
             if error:
                 st.error(error)
             else:
-                st.success(f"✅ 成功加载 {len(df)} 行数据")
-                st.session_state.file_df = df
-                st.session_state.data_mode = "file"
-
+                # 1. 生成新表名
+                new_table = f"temp_{st.session_state.session_id}_excel_data"
+                # 2. 如果已经存在旧表，先删掉
+                if st.session_state.excel_table and st.session_state.excel_table != new_table:
+                    cleanup_temp_table(st.session_state.excel_table)
+                # 3. 写一次表
+                temp_table = excel_to_postgresql(df, "excel_data")  # 返回 temp_xxx_excel_data
+                st.session_state.excel_table = temp_table
+                st.session_state.excel_df = df
+                st.success(f"✅ 文件已导入，表名：{temp_table}")
                 with st.expander("📊 数据预览（前 5 行）"):
                     st.dataframe(df.head(), use_container_width=True)
 
-        # AI 助手（文件模式）
-        if "file_df" in st.session_state and st.session_state.get("data_mode") == "file":
+        # 4. 只要表存在，就进入「数据库模式」问答
+        if st.session_state.excel_table:
             st.markdown("---")
             st.subheader("💬 问任何关于你数据的问题")
+            if "ai_chat" not in st.session_state:
+                st.session_state.ai_chat = []
 
-            df = st.session_state.file_df
-            schema = get_file_schema(df)
-            # 只取前 10 行作为样本，避免 token 超限
-            sample_data = df.head(10).to_csv(sep='\t', index=False)
-
-            if "ai_chat_file" not in st.session_state:
-                st.session_state.ai_chat_file = []
-
-            # 显示历史
-            for msg in st.session_state.ai_chat_file:
+            # 复用数据库对话历史展示
+            for msg in st.session_state.ai_chat:
                 with st.chat_message("user"):
                     st.markdown(msg["user"])
                 with st.chat_message("assistant"):
                     st.markdown(msg["answer"])
-                    if "df_preview" in msg:
-                        with st.expander("🔍 相关数据"):
-                            st.dataframe(msg["df_preview"], use_container_width=True)
+                    if "sql" in msg and msg["sql"] is not None:
+                        with st.expander("🔍 技术详情"):
+                            st.code(msg["sql"], language="sql")
+                            st.dataframe(msg["df"], use_container_width=True)
 
-            # 用户输入
-            if prompt := st.chat_input("例如：销售额最高的产品是什么？"):
+            if prompt := st.chat_input("例如：销售额最高的产品是什么？", key="file_chat_input"):
                 with st.chat_message("user"):
                     st.markdown(prompt)
+                st.session_state.ai_chat.append({"user": prompt, "answer": "", "sql": None, "df": None})
+                # 直接复用数据库 handler
+                st.session_state.db_type = "postgresql"
+                st.session_state.db_config = {"table": st.session_state.excel_table}
+                st.session_state.data_mode = "database"
+                db_chat_handler(prompt)
 
-                with st.chat_message("assistant"):
-                    with st.spinner("🧠 AI 正在分析数据..."):
-                        answer = ask_ai_answer_from_file(prompt, schema, sample_data)
-
-                    st.markdown(answer)
-
-                    # 保存对话（可附带完整数据或片段用于展示）
-                    st.session_state.ai_chat_file.append({
-                        "user": prompt,
-                        "answer": answer,
-                        "df_preview": df.head(10)  # 或根据问题动态筛选，MVP 用 head
-                    })
-
-            if st.button("🗑️ 清除对话（文件模式）"):
-                st.session_state.ai_chat_file = []
+            if st.button("🗑️ 清除对话"):
+                st.session_state.ai_chat = []
                 st.rerun()
+
+# -----------------------------  入口 ----------------------------- #
+if __name__ == "__main__":
+    run()

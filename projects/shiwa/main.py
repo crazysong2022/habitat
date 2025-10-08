@@ -4,6 +4,8 @@ import os
 from urllib.parse import urlparse
 import psycopg2
 from datetime import datetime, time
+from PIL import Image
+import io
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 from dotenv import load_dotenv
 # ================== ① AI 问答新增依赖 ==================
@@ -723,9 +725,9 @@ def add_stock_movement(movement_type, from_pond_id, to_pond_id, quantity,
         cur.close()
         conn.close()
 
-def add_death_record(from_pond_id: int, quantity: int, note: str = "", image_file=None):
+def add_death_record(from_pond_id: int, quantity: int, note: str = "", image_files=None):
     """
-    记录死亡出库 + 可选上传图片
+    记录死亡出库 + 可选上传多张图片
     """
     conn = get_db_connection()
     cur = conn.cursor()
@@ -746,20 +748,24 @@ def add_death_record(from_pond_id: int, quantity: int, note: str = "", image_fil
             WHERE id = %s;
         """, (quantity, from_pond_id))
 
-        # 3. 保存图片（如果上传了）
-        image_path = None
-        if image_file is not None:
-            # 生成唯一文件名：death_{movement_id}_{timestamp}.jpg
-            ext = image_file.name.split('.')[-1].lower() if '.' in image_file.name else 'jpg'
-            safe_name = f"death_{movement_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}"
-            image_path = os.path.join(DEATH_IMAGE_DIR, safe_name)
-            with open(image_path, "wb") as f:
-                f.write(image_file.getbuffer())
-            # 写入数据库
-            cur.execute("""
-                INSERT INTO death_image_shiwa (death_movement_id, image_path)
-                VALUES (%s, %s);
-            """, (movement_id, image_path))
+        # 3. 保存多张图片（如果上传了）
+        if image_files:
+            for image_file in image_files:
+                if image_file is not None:
+                    # 生成唯一文件名
+                    ext = image_file.name.split('.')[-1].lower() if '.' in image_file.name else 'jpg'
+                    safe_name = f"death_{movement_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{image_file.name}"
+                    image_path = os.path.join(DEATH_IMAGE_DIR, safe_name)
+                    
+                    # 保存图片
+                    with open(image_path, "wb") as f:
+                        f.write(image_file.getbuffer())
+                    
+                    # 写入数据库
+                    cur.execute("""
+                        INSERT INTO death_image_shiwa (death_movement_id, image_path)
+                        VALUES (%s, %s);
+                    """, (movement_id, image_path))
 
         conn.commit()
         return True, None
@@ -1739,14 +1745,18 @@ def run():
                         with st.form("death_record_form", clear_on_submit=True):
                             quantity = st.number_input("死亡数量", min_value=1, max_value=current, step=1)
                             note = st.text_area("备注（选填）", placeholder="如：病害、天气、人为等")
-                            image_file = st.file_uploader(
-                                "📸 上传死亡现场照片（可选）",
+
+                            # ✅ 仅保留多文件上传
+                            uploaded_files = st.file_uploader(
+                                "上传死亡现场照片（可一次选多张）",
                                 type=["png", "jpg", "jpeg"],
-                                accept_multiple_files=False
+                                accept_multiple_files=True,
+                                key="death_images_upload"
                             )
+
                             submitted = st.form_submit_button("✅ 记录死亡", type="primary")
                             if submitted:
-                                ok, msg = add_death_record(from_pond_id, quantity, note, image_file)
+                                ok, msg = add_death_record(from_pond_id, quantity, note, uploaded_files)
                                 if ok:
                                     st.success(f"✅ 死亡记录成功：{quantity} 只")
                                     st.rerun()
@@ -1935,8 +1945,7 @@ def run():
                 st.session_state.death_page = 0
 
             col_prev_d, col_next_d, col_info_d = st.columns([1, 1, 3])
-            current_page_d = st.session_state.death_page
-            current_page_d = max(0, current_page_d)
+            current_page_d = max(0, st.session_state.death_page)
 
             with col_prev_d:
                 if st.button("⬅️ 上一页", disabled=(current_page_d == 0), key="death_prev"):
@@ -1953,34 +1962,61 @@ def run():
 
             conn = get_db_connection()
             cur = conn.cursor()
+
+            # ① 先抓本页死亡记录
             cur.execute("""
-                SELECT 
-                    sm.id,
+                SELECT sm.id,
                     p.name AS pond_name,
                     sm.quantity,
                     sm.description,
-                    sm.moved_at,
-                    di.image_path
+                    sm.moved_at
                 FROM stock_movement_shiwa sm
                 JOIN pond_shiwa p ON sm.from_pond_id = p.id
-                LEFT JOIN death_image_shiwa di ON di.death_movement_id = sm.id
                 WHERE sm.movement_type = 'death'
                 ORDER BY sm.moved_at DESC
                 LIMIT %s OFFSET %s;
             """, (page_size_death, offset_d))
             death_rows = cur.fetchall()
+
+            # ② 一次性抓出这些记录对应的所有图片
+            death_ids = [r[0] for r in death_rows]
+            img_dict = defaultdict(list)  # key: death_movement_id, value: [path1, path2, ...]
+
+            if death_ids:
+                cur.execute("""
+                    SELECT death_movement_id, image_path
+                    FROM death_image_shiwa
+                    WHERE death_movement_id = ANY(%s);
+                """, (death_ids,))
+                for mid, path in cur.fetchall():
+                    img_dict[mid].append(path)
+
             cur.close()
             conn.close()
 
+            # ③ 展示
             if death_rows:
-                for record in death_rows:
-                    mid, pond, qty, desc, moved_at, img_path = record
+                for mid, pond, qty, desc, moved_at in death_rows:
                     with st.expander(f"🪦 {pond} · {qty} 只 · {moved_at.strftime('%Y-%m-%d %H:%M')}"):
                         st.write(f"**描述**：{desc}")
-                        if img_path and os.path.exists(img_path):
-                            st.image(img_path, caption="死亡现场", width=300)
+
+                        imgs = img_dict.get(mid, [])
+                        if imgs:
+                            st.markdown("**现场照片：**")
+                            # 每行 3 张图
+                            cols_per_row = 3
+                            for i in range(0, len(imgs), cols_per_row):
+                                cols = st.columns(cols_per_row)
+                                for j, img_path in enumerate(imgs[i:i+cols_per_row]):
+                                    if os.path.exists(img_path):
+                                        with cols[j]:
+                                            st.image(img_path, caption=f"照片 {i+j+1}", use_container_width=True)
+                                    else:
+                                        with cols[j]:
+                                            st.caption(f"照片 {i+j+1} 不存在")
                         else:
                             st.caption("🖼️ 无照片")
+
                 if len(death_rows) == page_size_death:
                     st.info("✅ 还有更多死亡记录，请点击「下一页」查看")
                 else:
