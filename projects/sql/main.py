@@ -1,10 +1,10 @@
-# app.py  2025-06-25  兼容 Excel→PG 临时表版本
 import streamlit as st
 import os
 import json
 import pandas as pd
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text, inspect
+import plotly.express as px
 from openai import OpenAI
 import tempfile
 import uuid
@@ -14,7 +14,7 @@ load_dotenv()
 # -----------------------------  AI 客户端 ----------------------------- #
 def get_ai_client():
     api_key = os.getenv("DASHSCOPE_API_KEY")
-    base_url = os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1").strip()
+    base_url = os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1 ").strip()
     if not api_key:
         st.error("❌ 请在 .env 中设置 DASHSCOPE_API_KEY")
         st.stop()
@@ -128,7 +128,59 @@ def generate_natural_answer(user_question: str, sql: str, result_df: pd.DataFram
         temperature=0.3
     )
     return response.choices[0].message.content.strip()
+# -----------------------------  自动画图 ----------------------------- #
+def auto_plot(df: pd.DataFrame) -> None:
+    """
+    根据查询结果自动选图并渲染到 Streamlit。
+    规则极简：
+      1. 只有 1 行 -> 画饼图（第一列是标签，第二列是数值）
+      2. 只有 2 列且都是数值 -> 散点图
+      3. 第一列是日期/字符串，其余列是数值 -> 折线/柱状
+    失败就静默跳过，不阻断主流程。
+    """
+    if df.empty or df.shape[1] < 2:
+        return
 
+    try:
+        # 列类型识别
+        cols = df.columns.to_list()
+        first_col = df[cols[0]]
+        other_cols = cols[1:]
+
+        # 1 行 -> 饼图
+        if len(df) == 1:
+            fig = px.pie(names=cols, values=df.iloc[0].tolist(),
+                         title="结果占比")
+            st.plotly_chart(fig, use_container_width=True)
+            return
+
+        # 2 列且全数值 -> 散点图
+        if df.shape[1] == 2 and pd.api.types.is_numeric_dtype(df[cols[1]]):
+            fig = px.scatter(df, x=cols[0], y=cols[1],
+                             title=f"{cols[1]} 随 {cols[0]} 变化")
+            st.plotly_chart(fig, use_container_width=True)
+            return
+
+        # 第一列是类别/日期，其余数值 -> 折线 or 柱状
+        if pd.api.types.is_datetime64_any_dtype(first_col) or pd.api.types.is_object_dtype(first_col):
+            # 长表变换，方便 Plotly 自动图例
+            df_melt = df.melt(id_vars=cols[0], value_vars=other_cols,
+                              var_name='指标', value_name='值')
+            fig = px.line(df_melt, x=cols[0], y='值', color='指标',
+                          markers=True, title="趋势图")
+            st.plotly_chart(fig, use_container_width=True)
+            return
+
+        # 默认：第一列类别，第二列数值 -> 横向柱状
+        if pd.api.types.is_numeric_dtype(df[cols[1]]):
+            fig = px.bar(df, x=cols[1], y=cols[0], orientation='h',
+                         title=f"{cols[1]} 排行")
+            st.plotly_chart(fig, use_container_width=True)
+            return
+
+    except Exception:
+        # 画不出来就拉倒
+        pass
 # -----------------------------  数据库 schema ----------------------------- #
 def get_db_schema(db_type, config):
     from sqlalchemy import inspect
@@ -213,6 +265,7 @@ def db_chat_handler(prompt: str):
             with st.expander("🔍 技术详情"):
                 st.code(ai_res["sql"], language="sql")
                 st.dataframe(df, use_container_width=True)
+                auto_plot(df)
             st.session_state.ai_chat.append({
                 "user": prompt, "answer": answer,
                 "sql": ai_res["sql"], "df": df
